@@ -1,0 +1,4 @@
+fastapi==0.133.1
+httpx==0.28.1
+uvicorn==0.41.0
+websockets==15.0.1

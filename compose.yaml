@@ -1,0 +1,20 @@
+services:
+  hermes-web:
+    build: .
+    # Linux host network keeps Gateway and Web bound to loopback.
+    network_mode: host
+    env_file: .env
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - web-state:/var/lib/hermes-web
+    restart: unless-stopped
+volumes:
+  web-state:

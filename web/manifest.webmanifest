@@ -1,0 +1,18 @@
+{
+  "name": "Hermes Web",
+  "short_name": "Hermes",
+  "lang": "zh-TW",
+  "start_url": "/mobile/",
+  "scope": "/mobile/",
+  "display": "standalone",
+  "background_color": "#f4f6fa",
+  "theme_color": "#f4f6fa",
+  "icons": [
+    {
+      "src": "/mobile/assistant.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
