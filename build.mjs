@@ -27,15 +27,18 @@ for (const name of files) {
   } else await copyFile(join(source, name), join(output, name));
 }
 let html = await readFile(join(output, 'index.html'), 'utf8');
+const assetVersions = {};
 for (const name of ['app.js', 'styles.css']) {
   const hash = createHash('sha256').update(await readFile(join(output, name))).digest('hex');
-  html = html.replaceAll(`${name}"`, `${name}?v=${hash.slice(0, 16)}"`);
+  assetVersions[name] = `${name}?v=${hash.slice(0, 16)}`;
+  html = html.replaceAll(`${name}"`, `${assetVersions[name]}"`);
 }
 await writeFile(join(output, 'index.html'), html);
 // Version the shell cache from the compiled assets so later deployments replace it.
 const shellHash = createHash('sha256');
 for (const name of files.filter(name => name !== 'sw.js')) shellHash.update(await readFile(join(output, name)));
-const worker = (await readFile(join(output, 'sw.js'), 'utf8')).replace(/hermes-web-static-v\d+/, `hermes-web-${shellHash.digest('hex').slice(0, 16)}`);
+let worker = (await readFile(join(output, 'sw.js'), 'utf8')).replace(/hermes-web-static-v\d+/, `hermes-web-${shellHash.digest('hex').slice(0, 16)}`);
+for (const [name, versioned] of Object.entries(assetVersions)) worker = worker.replaceAll(`/mobile/${name}"`, `/mobile/${versioned}"`);
 await writeFile(join(output, 'sw.js'), worker);
 for (const name of files) manifest[name] = createHash('sha256').update(await readFile(join(output, name))).digest('hex');
 const receipt = { compiler: `esbuild ${version}`, target: ['safari16', 'chrome110'], assets: manifest };

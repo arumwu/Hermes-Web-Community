@@ -3,12 +3,14 @@ const ASSETS = ['/mobile/', '/mobile/index.html', '/mobile/styles.css', '/mobile
   '/mobile/assistant.svg', '/mobile/assistant.svg', '/mobile/assistant.svg', '/mobile/assistant.svg',
   '/mobile/assistant.svg', '/mobile/file.svg', '/mobile/nav-home.svg', '/mobile/nav-history.svg',
   '/mobile/nav-tasks.svg', '/mobile/nav-files.svg', '/mobile/nav-profile.svg', '/mobile/nav-search.svg', '/mobile/nav-settings.svg'];
+const ASSET_PATHS = ASSETS.map(asset => asset.split('?')[0]);
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('activate', event => event.waitUntil(Promise.all([caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))), self.clients.claim()])));
 self.addEventListener('fetch', event => {
   const request = event.request;
   if (request.method !== 'GET' || request.mode === 'navigate') return;
   const url = new URL(request.url);
-  if (url.origin !== self.location.origin || !ASSETS.includes(url.pathname)) return;
-  event.respondWith(caches.match(request, { ignoreSearch: true }).then(hit => hit || fetch(request)));
+  if (url.origin !== self.location.origin || !ASSET_PATHS.includes(url.pathname)) return;
+  // A different build query must never receive an older cached script or stylesheet.
+  event.respondWith(caches.match(request).then(hit => hit || fetch(request)));
 });
