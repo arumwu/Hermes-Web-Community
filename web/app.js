@@ -115,6 +115,7 @@
     todayOperation: null, activeRuns: [], activeRunsComplete: false,
     sttMode: 'device', ttsMode: 'device', recorder: null, speechAudio: null,
     shareInbox: [], shareDraftIds: [], requestDrafts: new Map(), turnAttempts: new Map(),
+    queuedMessages: new Map(), steering: new Set(), modelSwitching: false, decisionSeen: new Set(), decisionDialog: null, speechPhase: 'idle',
     protocolReady: false, capabilityPromise: null, streamStarted: false, reasoning: '',
   };
   let noticeTimer;
@@ -122,8 +123,17 @@
   let activePdfURL = null;
   let activeAvatarURL = null;
   if (window.visualViewport) {
-    const resizeChat = () => document.documentElement.style.setProperty('--chat-height', `${window.visualViewport.height}px`);
-    window.visualViewport.addEventListener('resize', resizeChat); resizeChat();
+    // iOS pans the visual viewport as well as resizing it for the keyboard.
+    // Updating height alone applies that movement twice to an in-flow chat.
+    const resizeChat = () => {
+      const viewport = window.visualViewport;
+      document.documentElement.style.setProperty('--chat-height', `${viewport.height}px`);
+      document.documentElement.style.setProperty('--chat-top', `${viewport.offsetTop}px`);
+    };
+    window.visualViewport.addEventListener('resize', resizeChat);
+    window.visualViewport.addEventListener('scroll', resizeChat);
+    window.addEventListener('pageshow', resizeChat);
+    resizeChat();
   }
   const incomingShares = new Map();
   const icon = label => document.createTextNode(label);
@@ -152,7 +162,8 @@
   function row(children) { return el('div', { class: 'button-row' }, children); }
   function field(label, type = 'text', value = '', placeholder = '') {
     const input = type === 'textarea' ? el('textarea', { placeholder, value }) : el('input', { type, placeholder, value });
-    const wrap = el('div', { class: 'field' }, [el('label', { text: label }), input]);
+    input.id = `field-${crypto.randomUUID()}`;
+    const wrap = el('div', { class: 'field' }, [el('label', { text: label, for: input.id }), input]);
     return [wrap, input];
   }
   function clear(node = main) {
@@ -288,13 +299,139 @@
     if (Array.isArray(message?.content)) return message.content.map(part => typeof part === 'string' ? part : part?.text || '').join('\n');
     return '';
   }
+  // Keep navigation in this tab only; browser history never contains account data or drafts.
+  let mobileIndex = 0;
+  let mobileEpoch = crypto.randomUUID();
+  const mobilePages = new Map();
+  const mobileRouteFields = ['tab', 'mePage', 'filePath', 'files', 'document', 'profileDoc',
+    'sessionProject', 'showArchived', 'taskView', 'sessionMode', 'sessionTime', 'sessionSearch',
+    'sessionSearchVisible', 'workspaceRoot', 'showHiddenFiles', 'showPausedTasks', 'settingsSection'];
+  const mobileChatFields = ['selected', 'messages', 'messageOffset', 'streamed', 'reasoning',
+    'run', 'streamStarted', 'sendAttempted', 'attachments', 'shareDraftIds', 'toolCards'];
+  function mobileCapture() {
+    const route = Object.fromEntries(mobileRouteFields.map(key => [key, state[key]]));
+    const chat = state.tab === 'chat' ? Object.fromEntries(mobileChatFields.map(key => [key, state[key]])) : null;
+    return { route, chat, profile: state.profile, account: state.me?.account_scope,
+      nodes: [...main.childNodes], scroll: window.scrollY, mainScroll: main.scrollTop,
+      feedScroll: main.querySelector('.chat-scroll')?.scrollTop,
+      dialog: [...document.querySelectorAll('dialog[data-mobile-dialog][open]')].at(-1) };
+  }
+  let mobileDialogEntry = null, mobileDialogReturn = null;
+  function mobilePush() {
+    if (!state.me?.authenticated) return;
+    if (mobileDialogEntry && !mobileDialogEntry.dialog.open && mobileDialogEntry.index === mobileIndex) {
+      mobileDialogEntry = null;
+      return; // Reuse the closed sheet entry for its immediate destination.
+    }
+    mobilePages.set(mobileIndex, mobileCapture());
+    for (const index of mobilePages.keys()) if (index > mobileIndex) mobilePages.delete(index);
+    mobileIndex += 1;
+    history.pushState({ hermesMobile: mobileEpoch, page: mobileIndex }, '');
+  }
+  function mobileReset() {
+    mobileDialogEntry = null; mobileDialogReturn = null;
+    mobileEpoch = crypto.randomUUID(); mobileIndex = 0; mobilePages.clear();
+    history.replaceState({ hermesMobile: mobileEpoch, page: 0 }, '');
+    for (const dialog of document.querySelectorAll('dialog[data-mobile-dialog]')) {
+      dialog.close(); dialog.remove();
+    }
+  }
+  function mobileBack() {
+    const dialog = [...document.querySelectorAll('dialog[data-mobile-dialog][open]')].at(-1);
+    if (dialog) { if (!dialog._requestDismiss || dialog._requestDismiss()) dialog.close(); return; }
+    if (mobileIndex > 0) { history.back(); return; }
+    state.mePage = ''; state.document = null; state.tab = 'home'; render();
+  }
+  function mobileDialog(dialog) {
+    mobilePush(); const index = mobileIndex, epoch = mobileEpoch;
+    const entry = { dialog, index, epoch }; dialog._mobileEntry = entry; mobileDialogEntry = entry;
+    dialog.dataset.mobileDialog = 'true';
+    dialog.addEventListener('close', () => {
+      if (dialog.open) return;
+      dialog.remove();
+      setTimeout(() => {
+        if (!dialog.open && mobileDialogEntry === entry && epoch === mobileEpoch && index === mobileIndex) {
+          mobileDialogReturn = { page: index - 1, snapshot: mobileCapture() };
+          mobileDialogEntry = null; history.back();
+        }
+      }, 0);
+    });
+    dialog.showModal();
+    return dialog;
+  }
+  window.addEventListener('popstate', event => {
+    const editing = [...document.querySelectorAll('dialog[data-mobile-dialog][open]')].at(-1);
+    if (event.state?.hermesMobile === mobileEpoch && editing?._requestDismiss && !editing._requestDismiss()) {
+      history.pushState({ hermesMobile: mobileEpoch, page: mobileIndex }, '');
+      return;
+    }
+    if (event.state?.hermesMobile !== mobileEpoch) {
+      mobileReset(); state.tab = 'home'; state.mePage = ''; state.document = null; render(); return;
+    }
+    mobileDialogEntry = null;
+    const target = mobileDialogReturn?.page === event.state.page ? mobileDialogReturn.snapshot : mobilePages.get(event.state.page);
+    mobileDialogReturn = null;
+    mobilePages.set(mobileIndex, mobileCapture()); mobileIndex = event.state.page;
+    for (const dialog of document.querySelectorAll('dialog[data-mobile-dialog][open]')) if (dialog !== target?.dialog) dialog.close();
+    if (!target || target.profile !== state.profile || target.account !== state.me?.account_scope) {
+      state.tab = 'home'; state.mePage = ''; state.document = null; render(); return;
+    }
+    const changedSession = target.chat && (!state.selected || scopedSessionKey(target.chat.selected) !== scopedSessionKey(state.selected));
+    Object.assign(state, target.route);
+    if (changedSession) Object.assign(state, target.chat);
+    clear(); main.dataset.tab = state.tab;
+    const homeRoot = state.tab === 'home' && target.nodes.some(node => node.classList?.contains('home-top'));
+    if (state.document || homeRoot || (state.tab === 'me' && !state.mePage)) render();
+    else { main.append(...target.nodes); renderDock(); }
+    if (state.tab === 'chat') {
+      updateChat();
+      if (changedSession) recoverSession(false);
+    }
+    if (target.dialog) { if (!target.dialog.isConnected) document.body.append(target.dialog); if (!target.dialog.open) target.dialog.showModal(); mobileDialogEntry = target.dialog._mobileEntry; }
+    requestAnimationFrame(() => {
+      window.scrollTo(0, target.scroll); main.scrollTop = target.mainScroll;
+      const feed = main.querySelector('.chat-scroll');
+      if (feed && target.feedScroll !== undefined) feed.scrollTop = target.feedScroll;
+    });
+  });
+  function uiSheet(title, content) {
+    const dialog = el('dialog', { class: 'ui-sheet', 'aria-label': title });
+    const close = () => { dialog.close(); dialog.remove(); };
+    dialog.append(el('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
+      heading(title, '', [button('關閉', close, 'text-button')]), ...content);
+    dialog.addEventListener('click', event => { if (event.target === dialog) {
+      const rect = dialog.getBoundingClientRect();
+      if (event.clientY < rect.top || event.clientY > rect.bottom || event.clientX < rect.left || event.clientX > rect.right) close();
+    } });
+    dialog.addEventListener('close', () => { if (!dialog.open) dialog.remove(); });
+    document.body.append(dialog); mobileDialog(dialog); return { dialog, close };
+  }
+  function uiMore(label, options) {
+    const trigger = button('⋯', () => {
+      const sheet = uiSheet(label, options.map(([title, action, danger]) => button(title, () => {
+        sheet.close(); action();
+      }, danger ? 'danger-button sheet-action' : 'quiet-button sheet-action')));
+    }, 'text-button ui-more');
+    trigger.setAttribute('aria-label', label); return trigger;
+  }
+  function uiProfileLink(label, detail, glyph, action) {
+    return el('button', { class: 'profile-link', type: 'button', on: { click: action } }, [
+      appIcon(glyph), el('span', { class: 'grow' }, [text('strong', label), text('small', detail)]), text('span', '›')]);
+  }
+  function uiProfilePage(page) { mobilePush(); state.mePage = page; render(); }
+  function uiPageHeading(title) { return heading(title, '', [button('返回', mobileBack, 'text-button')]); }
+  function uiTime(value) {
+    const date = new Date(value || ''); if (!Number.isFinite(date.getTime())) return '';
+    const hours = Math.max(0, Math.floor((Date.now() - date.getTime()) / 3600000));
+    return hours < 1 ? '剛剛' : hours < 24 ? `${hours} 小時前` : date.toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' });
+  }
   function renderDock() {
     dock.hidden = !state.me?.authenticated || state.tab === 'chat';
     clear(dock);
     if (dock.hidden) return;
     for (const [id, label, glyph] of tabs) {
       dock.append(el('button', { type: 'button', 'aria-current': state.tab === id ? 'page' : null,
-        on: { click: () => switchTab(id) } }, [el('span', { class: 'dock-icon-well' }, [appIcon(glyph)]), text('span', label)]));
+        on: { click: () => { if (id === 'sessions') state.showArchived = false; switchTab(id); } } }, [el('span', { class: 'dock-icon-well' }, [appIcon(glyph), ...(id === 'sessions' && state.sessions.some(item => item.unread || item.is_unread) ? [el('i', { class: 'unread-dot' })] : [])]), text('span', label)]));
     }
   }
   function heading(title, subtitle, actions = []) {
@@ -318,6 +455,7 @@
     }
   }
   async function switchTab(tab) {
+    if (state.tab !== tab) mobilePush();
     state.tab = tab; render(); main.scrollTo(0, 0); window.scrollTo(0, 0);
     if (tab === 'sessions') { await refreshSessions(); await refreshProjects(); }
     if (tab === 'tasks') await refreshTasks();
@@ -368,7 +506,7 @@
       }, 'button')]));
   }
   function pickAvatarPhoto() {
-    const input = el('input', { type: 'file', accept: 'image/jpeg,image/svg+xml,image/webp', hidden: '', on: {
+    const input = el('input', { type: 'file', accept: 'image/jpeg,image/png,image/svg+xml,image/webp', hidden: '', on: {
       change: event => loadSafe(async () => {
         const file = event.target.files?.[0]; if (file) await showAvatarCrop(file);
       }) } });
@@ -481,11 +619,13 @@
       el('span', { class: 'file-well' }, [el('img', { src: '/mobile/file.svg', alt: '' })]),
       el('span', { class: 'grow' }, [text('strong', session.title || '新對話'),
         text('small', session.preview || '點按繼續這段對話')]),
+      text('span', uiTime(session.updated_at || session.updatedAt), 'recent-time'),
+      ...(session.unread || session.is_unread ? [el('i', { class: 'unread-dot' })] : []),
       text('span', '›', 'muted')]);
   }
   function showHomeSettings() {
-    clear();
-    main.append(heading('首頁設定', '', [button('關閉', render, 'quiet-button small')]));
+    mobilePush(); clear();
+    main.append(heading('首頁設定', '', [button('關閉', mobileBack, 'quiet-button small')]));
     const choices = el('div', { class: 'home-mode-choices' });
     for (const [mode, title, subtitle, icon] of [
       ['simple', '簡潔首頁', '打開就能聊', 'history'],
@@ -505,15 +645,19 @@
         iconButton('settings', '首頁設定', showHomeSettings)])]));
     const shareInbox = renderShareInbox(); if (shareInbox) main.append(shareInbox);
     const simple = state.homeMode === 'simple';
-    const hero = el('section', { class: `home-hero ${simple ? 'simple' : 'deep'}` }, [
+    const talk = button('', openDaily, 'button home-talk');
+    talk.append(...(simple && state.skin === 'clean' ? [text('span', '跟我說'), chatGlyph('arrow')] : [chatGlyph('wave'), text('span', '跟我說')]));
+    const hero = el('section', { class: `home-hero ${simple ? 'simple' : 'deep'} skin-${state.skin}` }, [
+      ...(simple && state.skin === 'clean' ? [text('div', '日常助理', 'hero-eyebrow')] : []),
       text('h1', `${salutation}，${state.nickname || '朋友'}`),
-      ...(simple ? [text('p', '生活偶爾卡頓，也能繼續', 'home-caption')] : []),
-      el('img', { src: simple ? '/mobile/assistant.svg' : '/mobile/assistant.svg',
+      ...(simple ? [text('p', state.pending.size ? `有 ${state.pending.size} 件事，等你決定。` : state.activeRuns.length ? `有 ${state.activeRuns.length} 件事正在進行，我在這裡。` : '生活偶爾卡頓，也能繼續', 'home-caption')] : []),
+      el('img', { src: '/mobile/assistant.svg',
         class: 'home-mascot', alt: 'Hermes' }),
-      el('div', { class: 'home-actions' }, [button('跟我說', openDaily, 'button'),
+      el('div', { class: 'home-actions' }, [talk,
         ...(!simple ? [button('幫我做…', newSession, 'quiet-button')] : [])])
     ]);
     main.append(hero);
+    if (simple && state.pending.size) main.append(requestCard(state.pending.values().next().value));
     if (state.homeMode === 'deep') {
       const board = state.today?.board;
       const formatError = state.today?.format_error;
@@ -537,10 +681,11 @@
         row([button('核對回執', checkTodayReceipt, 'soft-button small'),
           button('查看處理對話', openTodayOperationSession, 'quiet-button small')])]));
     } else {
-      main.append(el('div', { class: 'recent-heading' }, [text('h2', '接著上次的事'),
-        button('全部 ›', () => switchTab('sessions'), 'text-button') ]));
+      const recentHeading = el('div', { class: 'recent-heading' }, [text('h2', '接著上次的事'),
+        button('全部 ›', () => switchTab('sessions'), 'text-button') ]);
       const recent = state.sessions.slice(0, 2);
-      const recentPanel = el('section', { class: 'recent-panel' });
+      const recentPanel = el('section', { class: `recent-panel recent-${state.skin}` });
+      if (state.skin === 'glass') recentPanel.append(recentHeading); else main.append(recentHeading);
       if (!recent.length) {
         recentPanel.append(
           el('button', { class: 'home-recent-row', type: 'button', on: { click: () => switchTab('tasks') } }, [
@@ -554,7 +699,7 @@
       main.append(recentPanel);
     }
   }
-  function setHomeMode(mode) { state.homeMode = mode; localStorage.setItem('hermes-web:homeMode', mode); render(); if (mode === 'deep') loadToday(); }
+  function setHomeMode(mode) { state.homeMode = mode; localStorage.setItem('hermes-web:homeMode', mode); mobileBack(); if (mode === 'deep') loadToday(); }
   async function refreshHome() { await refreshSessions(false); if (state.homeMode === 'deep') await loadToday(); if (state.tab === 'home') render(); }
   async function loadToday() {
     await loadSafe(async () => {
@@ -601,10 +746,10 @@
       ...(Array.isArray(presentation.facts) ? presentation.facts.map(fact => text('p', fact)) : []),
       text('p', `狀態：${item.status || '未知'} · 資料日期：${item.when || state.today?.board?.date || '未提供'}`),
       text('p', `來源：${Array.isArray(item.sources) && item.sources.length ? item.sources.join('、') : '未提供'}`),
-      row([button('返回首頁', render, 'quiet-button small'),
+      row([button('返回', mobileBack, 'quiet-button small'),
         button('聊聊這件事', () => discussTodayCard(item), 'soft-button small'),
         ...(presentation.interaction ? [button('提交', () => showTodayAction(item), 'button small')] : [])])]);
-    clear(); main.append(panel);
+    mobilePush(); clear(); main.append(panel);
   }
   async function discussTodayCard(item) {
     const today = state.today;
@@ -650,7 +795,7 @@
     }
     const reviewed = el('input', { type: 'checkbox' });
     if (interaction.type === 'milestones') panel.append(el('label', { class: 'row' }, [reviewed, text('span', '我已核對驗收條件')]));
-    panel.append(row([button('返回首頁', render, 'quiet-button small'), button('提交並核對', () => {
+    panel.append(row([button('返回', mobileBack, 'quiet-button small'), button('提交並核對', () => {
       const selected = [...checks].filter(([, control]) => control.checked).map(([id]) => id);
       const single = ['comparison', 'clarification', 'time_picker'].includes(interaction.type);
       const input = { selected_ids: single ? [] : selected, order: items.map(option => option.id),
@@ -661,15 +806,15 @@
         reviewed: reviewed.checked };
       prepareToday('apply_card_action', item.id, input);
     }, 'button')]));
-    clear(); main.append(panel);
+    mobilePush(); clear(); main.append(panel);
   }
   function showTodaySchedule() {
     const [morningWrap, morning] = field('早上時間', 'time', '08:15');
     const [eveningWrap, evening] = field('晚上時間', 'time', '21:00');
     const [zoneWrap, zone] = field('時區', 'text', Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Taipei');
-    clear(); main.append(card([text('h2', '早晚整理'), morningWrap, eveningWrap, zoneWrap,
-      text('p', '澪會先核對原本的定時安排，避免重複建立。'),
-      row([button('返回首頁', render, 'quiet-button small'), button('交給澪設定', () => {
+    mobilePush(); clear(); main.append(card([text('h2', '早晚整理'), morningWrap, eveningWrap, zoneWrap,
+      text('p', 'Hermes會先核對原本的定時安排，避免重複建立。'),
+      row([button('返回', mobileBack, 'quiet-button small'), button('交給Hermes設定', () => {
         if (morning.value === evening.value) return notice('早晚時間需不同。');
         prepareToday('configure_card_schedule', '', null, { morning: morning.value, evening: evening.value, timezone: zone.value.trim() });
       }, 'button')])]));
@@ -712,13 +857,14 @@
       const operation = { operation_id: operationId, mode, card_id: cardId, profile,
         workspace: today.workspace, session_id: session.id, submitted_at: new Date().toISOString() };
       saveTodayOperation(operation);
+      mobilePush();
       state.sessions.unshift(session); state.sendAttempted = false; state.streamStarted = false; state.selected = session; state.messages = [{ role: 'user', text: prepared.prompt }];
       state.tab = 'chat'; state.run = 'running'; state.sendAttempted = true; render();
       try {
         await rpc('prompt.submit', { session_id: session.runtimeId, profile, text: promptText,
           client_submission_id: operationId }, 120000);
         session.fresh = false; state.sendAttempted = false;
-        notice('已交給澪處理；需核對今日回執才算完成。');
+        notice('已交給Hermes處理；需核對今日回執才算完成。');
       } catch (error) {
         state.run = 'uncertain'; render();
         throw new Error('送出結果不明。請核對原處理對話與今日回執；不會自動重送。');
@@ -749,23 +895,69 @@
   }
   function sessionItem(session) {
     const title = session.title || '新對話';
-    const open = el('button', { type: 'button', class: 'list-item', on: { click: () => openSession(session) } }, [
-      el('span', { class: 'file-well' }, [el('img', { src: '/mobile/file.svg', alt: '' })]),
-      el('span', { class: 'grow' }, [text('strong', title), text('small', session.preview || session.model || '點選繼續對話')]),
-      text('span', '›', 'muted'),
-    ]);
     const id = encodeURIComponent(session.id);
-    const actions = state.showArchived ? [button('還原', () => updateSession(id, { archived: false }), 'quiet-button small')] : [
-      button('改名', () => {
-        const next = prompt('對話名稱', title)?.trim();
-        if (next && next.length <= 120 && !/[\r\n]/.test(next)) updateSession(id, { title: next });
-      }, 'quiet-button small'),
-      button(session.pinned ? '取消置頂' : '置頂', () => updateSession(id, { pinned: !session.pinned }), 'quiet-button small'),
-      button('封存', () => updateSession(id, { archived: true }), 'quiet-button small'),
+    const rename = () => {
+      const [wrap, input] = field('對話名稱', 'text', title);
+      const sheet = uiSheet('重新命名', [wrap, button('儲存', () => {
+        const next = input.value.trim();
+        if (!next || next.length > 120 || /[\r\n]/.test(next)) return notice('請輸入 1–120 字的單行名稱。');
+        sheet.close(); updateSession(id, { title: next });
+      }, 'button')]); input.focus();
+    };
+    const confirmChange = (label, action) => {
+      const sheet = uiSheet(label, [text('p', `確定${label}「${title}」？`), row([
+        button('取消', () => sheet.close(), 'quiet-button'),
+        button(`確認${label}`, () => { sheet.close(); action(); }, label === '刪除對話' ? 'danger-button' : 'button')])]);
+    };
+    const archive = () => confirmChange('封存對話', () => updateSession(id, { archived: true }));
+    const remove = () => confirmChange('刪除對話', () => loadSafe(async () => {
+      await api(`/sessions/${id}`, { method: 'DELETE' }); await refreshSessions(); notice('已刪除並重新讀取對話。');
+    }));
+    const choices = state.showArchived ? [['還原對話', () => updateSession(id, { archived: false })], ['刪除對話', remove, true]] : [
+      ['重新命名', rename], [session.pinned ? '取消置頂' : '置頂', () => updateSession(id, { pinned: !session.pinned })],
+      ['封存對話', archive], ['刪除對話', remove, true],
     ];
-    return el('div', { class: 'conversation-row' }, [open,
-      el('details', { class: 'conversation-actions' }, [el('summary', { text: '更多操作' }), row(actions)])]);
+    const actions = uiMore(title, choices); actions.setAttribute('aria-label', `${title}的更多操作`);
+    const open = el('button', { type: 'button', class: 'list-item session-open', on: { click: event => {
+      if (open._ignoreClick) { event.preventDefault(); open._ignoreClick = false; return; } openSession(session);
+    } } }, [el('span', { class: 'file-well' }, [el('img', { src: '/mobile/file.svg', alt: '' })]),
+      el('span', { class: 'grow' }, [el('span', { class: 'session-title-line' }, [
+        text('strong', `${session.pinned ? '⌖ ' : ''}${title}`),
+        ...(session.unread || session.is_unread ? [el('i', { class: 'unread-dot' })] : []),
+        text('time', uiTime(session.updated_at || session.updatedAt), 'session-time')]),
+        text('small', session.preview || session.model || '點選繼續對話')])]);
+    const shell = el('div', { class: 'conversation-row' });
+    const revealed = el('div', { class: 'swipe-actions', inert: '', 'aria-hidden': 'true' }, [
+      button(state.showArchived ? '還原' : '封存', state.showArchived ? () => updateSession(id, { archived: false }) : archive, 'soft-button swipe-action'),
+      button('刪除', remove, 'danger-button swipe-action')]);
+    const front = el('div', { class: 'session-front' }, [open, actions]);
+    shell.append(revealed, front);
+    let start = null, timer = null, offset = 0;
+    const cancel = () => { clearTimeout(timer); timer = null; };
+    open.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      start = { x: event.clientX, y: event.clientY }; offset = 0;
+      timer = setTimeout(() => { open._ignoreClick = true; actions.click(); start = null; }, 550);
+    });
+    open.addEventListener('pointermove', event => {
+      if (!start) return;
+      const dx = event.clientX - start.x, dy = event.clientY - start.y;
+      if (Math.abs(dx) + Math.abs(dy) > 10) cancel();
+      if (Math.abs(dy) > Math.abs(dx) && !offset) { start = null; return; }
+      if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy)) {
+        offset = Math.max(-132, Math.min(0, dx)); front.style.transform = `translateX(${offset}px)`;
+        open._ignoreClick = true;
+      }
+    });
+    open.addEventListener('pointerup', () => { cancel(); start = null;
+      const expanded = offset <= -132 * .28;
+      front.style.transform = expanded ? 'translateX(-132px)' : '';
+      revealed.inert = !expanded; revealed.setAttribute('aria-hidden', String(!expanded)); });
+    open.addEventListener('pointercancel', () => { cancel(); start = null; front.style.transform = '';
+      revealed.inert = true; revealed.setAttribute('aria-hidden', 'true'); });
+    return shell;
   }
+
   function sessionDateGroup(session, now = new Date()) {
     if (session.pinned) return '置頂';
     const date = new Date(session.updated_at || session.updatedAt || session.created_at || '');
@@ -815,46 +1007,57 @@
     });
   }
   function renderSessions() {
-    main.append(heading('回看', state.profile, [button('＋ 新對話', newSession, 'text-button')]));
-    main.append(el('div', { class: 'session-filters' }, [button('最近', () => { state.showArchived = false; refreshSessions(); },
-      state.showArchived ? 'quiet-button small' : 'soft-button small'),
-      button('已封存', () => { state.showArchived = true; refreshSessions(); },
-        state.showArchived ? 'soft-button small' : 'quiet-button small')]));
     const search = el('input', { class: 'search', type: 'search', placeholder: '搜尋已載入的對話',
-      'aria-label': '搜尋對話', on: { input: () => drawList() } });
-    const project = el('select', { 'aria-label': '依專案篩選', on: { change: event => {
-      state.sessionProject = event.target.value; drawList();
-    } } }, [el('option', { value: '', text: '所有專案' })]);
-    for (const item of state.projects) {
-      const path = item.primary_path || item.primaryPath || item.paths?.[0];
-      if (path) project.append(el('option', { value: path, text: item.name || item.label || path,
-        selected: path === state.sessionProject ? '' : null }));
-    }
+      value: state.sessionSearch || '', 'aria-label': '搜尋對話', on: { input: () => { state.sessionSearch = search.value; drawList(); } } });
+    search.hidden = !state.sessionSearchVisible;
+    main.append(heading(state.showArchived ? '已封存對話' : '回看', '', [
+      iconButton('search', '搜尋對話', () => { state.sessionSearchVisible = !state.sessionSearchVisible;
+        search.hidden = !state.sessionSearchVisible; if (!search.hidden) search.focus(); }),
+      button('＋', newSession, 'text-button session-create')]));
+    const profile = el('select', { class: 'session-profile', 'aria-label': '切換 Profile', on: { change: async () => {
+      if (profile.value === state.profile) return;
+      mobileReset(); state.profile = profile.value; state.workspaceRoot = ''; state.shareInbox = []; state.shareDraftIds = []; state.attachments = []; state.settings = null; state.selected = null; state.sessions = []; state.projects = []; state.sessionProject = '';
+      state.pending.clear(); state.cron = []; state.files = null; state.document = null; state.inventory = null;
+      state.activeRuns = []; state.activeRunsComplete = false; state.taskSessions = []; state.run = 'idle'; state.filePath = ''; state.profileDoc = null; state.today = null; restoreTodayOperation();
+      await refreshSessions(); await refreshProjects();
+    } } }, (Array.isArray(state.me?.profiles) ? state.me.profiles : [state.profile]).map(value => el('option', { value, text: value, selected: value === state.profile ? '' : null })));
+    main.append(profile);
+    const select = (label, value, options, change) => el('select', { 'aria-label': label,
+      on: { change: event => { change(event.target.value); drawList(); } } }, options.map(([key, title]) => el('option', {
+        value: key, text: title, selected: key === value ? '' : null })));
+    const mode = select('排列方式', state.sessionMode || 'recent', [['recent', '最近'], ['projects', '專案']], value => { state.sessionMode = value; });
+    const project = select('依專案篩選', state.sessionProject || '', [['', '全部專案'], ...state.projects.map(item =>
+      [item.primary_path || item.primaryPath || item.paths?.[0] || item.id, item.name || item.label || item.id])], value => { state.sessionProject = value; });
+    const time = select('時間範圍', state.sessionTime || 'all', [['all', '全部時間'], ['today', '今天'], ['week', '最近 7 天'], ['month', '最近 30 天']], value => { state.sessionTime = value; });
+    main.append(el('div', { class: 'session-filter-selects' }, [mode, project, time]), search);
     const list = el('div', { class: 'session-groups' });
     const drawList = () => {
       clear(list); const query = search.value.trim().toLowerCase();
-      const sessions = state.sessions.filter(s =>
-        (!query || `${s.title || ''} ${s.preview || ''}`.toLowerCase().includes(query)) &&
-        (!state.sessionProject || [s.workspacePath, s.cwd, s.git_repo_root].includes(state.sessionProject)));
-      if (!sessions.length) list.append(text('p', query ? '這頁沒有符合的對話。' : '尚無對話。', 'empty'));
-      else {
-        const grouped = new Map();
-        for (const session of sessions) {
-          const group = sessionDateGroup(session);
-          if (!grouped.has(group)) grouped.set(group, []);
-          grouped.get(group).push(session);
-        }
-        for (const group of ['置頂', '今天', '昨天', '最近 7 天', '更早']) {
-          if (!grouped.has(group)) continue;
-          list.append(text('h2', group, 'group-label'),
-            el('section', { class: 'session-group' }, grouped.get(group).map(sessionItem)));
-        }
+      const matchesProject = (session, path) => [session.workspacePath, session.cwd, session.git_repo_root, session.project_id, session.projectId].includes(path);
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const cutoff = state.sessionTime === 'today' ? +today : state.sessionTime === 'week' ? Date.now() - 7 * 86400000 : state.sessionTime === 'month' ? Date.now() - 30 * 86400000 : 0;
+      const sessions = state.sessions.filter(item => (!query || `${item.title || ''} ${item.preview || ''}`.toLowerCase().includes(query)) &&
+        (!state.sessionProject || matchesProject(item, state.sessionProject)) && (!cutoff || +new Date(item.updated_at || item.updatedAt || item.created_at || '') >= cutoff));
+      const grouped = new Map();
+      for (const session of sessions) {
+        const group = state.sessionMode === 'projects' ? state.projects.find(item => matchesProject(session, item.primary_path || item.primaryPath || item.paths?.[0] || item.id))?.name || '未分類專案' : sessionDateGroup(session);
+        if (!grouped.has(group)) grouped.set(group, []); grouped.get(group).push(session);
       }
+      if (!sessions.length) {
+        list.append(text('p', query || cutoff || state.sessionProject ? '沒有符合條件的對話。' : '尚無對話。', 'empty'));
+        if (query || cutoff || state.sessionProject) list.append(button('清除篩選', () => {
+          state.sessionSearch = ''; state.sessionTime = 'all'; state.sessionProject = '';
+          search.value = ''; time.value = 'all'; project.value = ''; drawList();
+        }, 'quiet-button'));
+      }
+      const order = state.sessionMode === 'projects' ? [...grouped.keys()] : ['置頂', '今天', '昨天', '最近 7 天', '更早'];
+      for (const group of order) if (grouped.has(group)) list.append(text('h2', group, 'group-label'), el('section', { class: 'session-group' }, grouped.get(group).map(sessionItem)));
     };
-    main.append(search, project, list);
+    main.append(list, button('重新整理', refreshSessions, 'text-button'));
     if (state.sessionsMore) main.append(button('載入更早的對話', loadMoreSessions, 'quiet-button'));
     drawList();
   }
+
   async function newSession() {
     await loadSafe(async () => {
       const profile = state.profile;
@@ -866,11 +1069,13 @@
       const session = { id: result.stored_session_id || runtimeId, runtimeId, title: '新對話',
         profile, model: info.model || '', provider: info.provider || '', reasoningEffort: info.reasoning_effort || '',
         workspacePath: info.cwd || info.git_repo_root || '', fresh: true };
+      mobilePush();
       state.sessions.unshift(session); state.sendAttempted = false; state.streamStarted = false; state.selected = session; state.messages = []; state.messageOffset = 0; state.toolCards = [];
       state.streamed = ''; state.reasoning = ''; state.run = 'idle'; state.attachments = []; state.shareDraftIds = []; state.tab = 'chat'; render();
     });
   }
   async function openSession(session) {
+    mobilePush();
     state.selected = { ...session, profile: session.profile || state.profile };
     state.sendAttempted = state.turnAttempts.has(scopedSessionKey(state.selected)); state.run = 'recovering'; state.streamStarted = false;
     state.tab = 'chat'; state.messages = []; state.messageOffset = 0; state.streamed = ''; state.reasoning = ''; state.toolCards = []; state.attachments = []; state.shareDraftIds = [];
@@ -909,10 +1114,17 @@
         if (state.profile !== session.profile || state.selected?.id !== session.id) return;
         if (receipt.state === 'accepted' || receipt.state === 'rejected') {
           state.turnAttempts.delete(attemptKey); state.sendAttempted = false;
-          if (receipt.state === 'rejected') { saveDraft(session, attempt.draft || ''); notice('原操作未被接受；草稿保留，請核對後再決定。'); }
+          const queued = state.queuedMessages.get(attemptKey);
+          if (queued?.submissionId === attempt.id) {
+            if (receipt.state === 'accepted') state.queuedMessages.delete(attemptKey);
+            else { queued.uncertain = false; queued.ready = true; delete queued.submissionId;
+              notice('排隊訊息未被接受；文字與附件已保留，請核對後再送出。'); }
+          } else if (receipt.state === 'rejected') { saveDraft(session, attempt.draft || ''); notice('原操作未被接受；草稿保留，請核對後再決定。'); }
         } else { state.sendAttempted = true; state.run = 'uncertain'; }
       } else state.sendAttempted = Boolean(attempt);
 
+      const queued = state.queuedMessages.get(attemptKey);
+      if (queued && !resumed.running && state.run === 'idle' && !queued.uncertain) queued.ready = true;
       if (notify) notice(resumed.running ? '已接回正在執行的對話。' : '已從伺服器讀回對話。');
       if (state.tab === 'chat') render();
     });
@@ -987,35 +1199,287 @@
     if (role === 'assistant' && serverText(message)) article.append(button('朗讀', () => speakText(serverText(message)), 'quiet-button small'));
     return article;
   }
+  function chatSheet(title, content) {
+    const dialog = el('dialog', { class: 'chat-sheet', 'aria-label': title });
+    const close = button('關閉', () => dialog.close(), 'quiet-button');
+    dialog.append(el('header', { class: 'sheet-header' }, [text('h2', title), close]), content);
+    document.body.append(dialog);
+    dialog.addEventListener('close', () => dialog.remove(), { once: true });
+    if (typeof mobileDialog === 'function') mobileDialog(dialog); else dialog.showModal();
+    return dialog;
+  }
+  function chatGlyph(name) {
+    const paths = { plus: 'M12 5v14M5 12h14', wave: 'M4 9v6M8 5v14M12 3v18M16 7v10M20 10v4',
+      arrow: 'M12 19V5m-6 6 6-6 6 6', stop: 'M7 7h10v10H7Z',
+      back: 'M15 5l-7 7 7 7', more: 'M6 12h.01M12 12h.01M18 12h.01' };
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    for (const [key, value] of Object.entries({ viewBox: '0 0 24 24', width: '24', height: '24', 'aria-hidden': 'true', fill: name === 'stop' ? 'currentColor' : 'none', stroke: 'currentColor', 'stroke-width': name === 'more' ? '3.6' : '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })) svg.setAttribute(key, value);
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', paths[name]); svg.append(path); return svg;
+  }
+  function updateComposer() {
+    const layout = main.querySelector('.chat-layout'); if (!layout || !state.selected) return;
+    const input = layout.querySelector('.composer textarea');
+    input.style.height = 'auto'; input.style.height = `${Math.min(144, Math.max(48, input.scrollHeight))}px`;
+    const busy = state.modelSwitching || ['preparing', 'uncertain'].includes(state.run);
+    input.disabled = busy;
+    const primary = layout.querySelector('.chat-send');
+    const hasDraft = Boolean(input.value.trim() || state.attachments.length);
+    const action = state.run === 'running' ? 'stop' : hasDraft ? 'arrow' : 'wave';
+    primary.replaceChildren(chatGlyph(action)); primary.dataset.action = action;
+    primary.setAttribute('aria-label', action === 'stop' ? '停止' : action === 'arrow' ? '送出' : '語音輸入');
+    primary.disabled = busy || (state.run !== 'running' && state.speechPhase !== 'idle');
+    layout.querySelector('.composer-add').disabled = busy;
+    const actions = layout.querySelector('.running-actions');
+    actions.hidden = state.run !== 'running' || !hasDraft;
+    layout.querySelector('.chat-steer').disabled = state.steering.has(scopedSessionKey(state.selected)) || !input.value.trim() || Boolean(state.attachments.length);
+    const queued = state.queuedMessages.get(scopedSessionKey(state.selected));
+    layout.querySelector('.chat-queue').textContent = queued ? '替換排隊訊息' : '排隊發送';
+    const queue = layout.querySelector('.queue-state'); queue.replaceChildren();
+    if (queued) queue.append(text('span', queued.uncertain ? '排隊訊息送出狀態待同步核對' : queued.ready ? '上一輪已結束，排隊訊息待送出' : '已有一則訊息排隊中'),
+      ...(queued.ready && !queued.uncertain && !queued.sending ? [button('送出排隊訊息', () => drainQueuedMessage(state.selected), 'quiet-button')] : []),
+      button('取消排隊', () => { state.queuedMessages.delete(scopedSessionKey(state.selected)); updateComposer(); }, 'quiet-button'));
+    const voice = layout.querySelector('.voice-state'); voice.replaceChildren();
+    if (state.recorder) voice.append(text('span', '正在錄音'), button('完成錄音', () => state.recorder?.stop(), 'quiet-button'));
+    else if (state.speechPhase !== 'idle') voice.append(text('span', state.speechPhase === 'transcribing' ? '正在辨識語音…' : '正在聽你說話…'));
+  }
+  function sheetIcon(name) {
+    const paths = { file: 'M14 2H6v20h12V6l-4-4Zm0 0v5h5M9 12h6M9 16h6', photo: 'M3 3h18v18H3ZM3 17l6-7 5 5 3-3 4 5M15 7h.01',
+      command: 'm4 6 6 6-6 6m9 0h7', space: 'M3 7h7l2-3h9v16H3Z', model: 'm12 2 9 5v10l-9 5-9-5V7Zm0 0v20M3 7l9 5 9-5',
+      thought: 'M9 18h6m-6 3h6M8 15c0-2-3-3-3-7a7 7 0 0 1 14 0c0 4-3 5-3 7Z', sync: 'M20 7a9 9 0 0 0-15-2L2 8m0-6v6h6m-4 9a9 9 0 0 0 15 2l3-3m0 6v-6h-6', snippet: 'M5 3h14v18H5ZM8 8h8M8 12h8M8 16h5' };
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    for (const [key, value] of Object.entries({ viewBox: '0 0 24 24', width: '24', height: '24', 'aria-hidden': 'true', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.7', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })) svg.setAttribute(key, value);
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', paths[name] || paths.snippet); svg.append(path); return svg;
+  }
+  function showChatOptions() {
+    const panel = el('div', { class: 'sheet-content assistant-menu' });
+    const dialog = chatSheet('Hermes 助理面板', panel);
+    panel.append(text('p', '管理目前對話，不改變其他對話', 'muted'));
+    const next = fn => () => { dialog.close(); fn(); };
+    for (const [label, subtitle, icon, action] of [
+      ['模型', state.selected?.model || '跟隨 Hermes 預設模型', 'model', showModelPicker],
+      ['思考程度', state.selected?.reasoningEffort || '跟隨目前模型', 'thought', showReasoningPicker],
+      ['工作專案', state.selected?.workspacePath || '選擇這段對話的工作空間', 'space', showProjectPicker],
+      ['同步對話', '讀取伺服器的最新狀態', 'sync', () => recoverSession()],
+    ]) panel.append(el('button', { type: 'button', class: 'assistant-entry', on: { click: next(action) } }, [
+      el('span', { class: 'sheet-icon-well' }, [sheetIcon(icon)]), el('span', { class: 'grow' }, [text('strong', label), text('small', subtitle)]), text('span', '›', 'muted')]));
+  }
+  function showComposerTools(fileInput) {
+    const origin = state.selected, account = state.me?.account_scope;
+    const panel = el('div', { class: 'sheet-content composer-tools' });
+    const dialog = chatSheet('加入對話', panel);
+    const defaults = () => [{ title: '梳理目標', body: '先梳理目標，再給出可執行步驟' },
+      { title: '整理重點', body: '整理重點，並列出需要我確認的事項' }, { title: '改進內容', body: '檢查現有內容，直接給出改進後的版本' }];
+    const snippetsKey = `hermes-web:snippets:${account || 'unknown'}:${state.profile}`;
+    let snippets; try { snippets = JSON.parse(localStorage.getItem(snippetsKey) || 'null'); } catch { snippets = null; }
+    if (!Array.isArray(snippets)) snippets = defaults();
+    snippets = snippets.filter(item => typeof item?.title === 'string' && typeof item?.body === 'string');
+    const save = () => localStorage.setItem(snippetsKey, JSON.stringify(snippets));
+    let managing = false, editor = null, confirming = false;
+    const title = dialog.querySelector('h2');
+    const confirm = (heading, description, label, action) => {
+      const content = el('div', { class: 'sheet-content' }, [text('p', description)]);
+      const confirmation = chatSheet(heading, content);
+      content.append(row([button('取消', () => confirmation.close(), 'quiet-button'), button(label, () => { action(); confirmation.close(); }, 'danger-button')]));
+      return confirmation;
+    };
+    const leaveEditor = (close = false) => {
+      const leave = () => { editor = null; if (close) dialog.close(); else draw(); };
+      if (editor && (editor.title.value !== editor.original.title || editor.body.value !== editor.original.body)) {
+        if (!confirming) {
+          confirming = true;
+          const editorNodes = [...panel.childNodes];
+          title.textContent = '放棄未儲存內容？';
+          panel.replaceChildren(text('p', '這次編輯尚未儲存。'), row([
+            button('繼續編輯', () => { confirming = false; title.textContent = '編輯片段'; panel.replaceChildren(...editorNodes); }, 'quiet-button'),
+            button('放棄修改', () => { confirming = false; leave(); }, 'danger-button')]));
+        }
+        return false;
+      }
+      if (!close) { editor = null; draw(); }
+      return true;
+    };
+    dialog._requestDismiss = () => leaveEditor(true);
+    dialog.querySelector('.sheet-header button').addEventListener('click', event => {
+      if (!leaveEditor(true)) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true });
+    dialog.addEventListener('cancel', event => { if (!leaveEditor(true)) event.preventDefault(); });
+    const edit = index => {
+      const original = snippets[index] || { title: '', body: '' };
+      const [tw, ti] = field('名稱', 'text', original.title); ti.maxLength = 40;
+      const [bw, bi] = field('提示詞內容', 'textarea', original.body); bi.maxLength = 8000; bi.rows = 4;
+      editor = { original, index, title: ti, body: bi }; title.textContent = '編輯片段';
+      const count = text('small', `${bi.value.length} / 8000`, 'muted');
+      const saveButton = button('儲存片段', () => {
+        if (!ti.value.trim() || !bi.value.trim()) return;
+        const value = { title: ti.value.trim(), body: bi.value.trim() };
+        if (index === null) snippets.push(value); else snippets[index] = value;
+        save(); editor = null; draw();
+      }, 'button');
+      const sync = () => { count.textContent = `${bi.value.length} / 8000`; saveButton.disabled = !ti.value.trim() || !bi.value.trim(); };
+      ti.addEventListener('input', sync); bi.addEventListener('input', sync);
+      panel.replaceChildren(row([text('p', '儲存後即可在對話中重複使用', 'grow muted'), button('返回', () => leaveEditor(), 'text-button')]), tw, bw, count, saveButton); sync();
+    };
+    const draw = () => {
+      panel.replaceChildren(); title.textContent = managing ? '管理提示詞' : '加入對話';
+      panel.append(text('p', managing ? '依常用順序排列，點選後可繼續編輯' : '選擇資料或使用常用提示詞', 'muted'));
+      if (managing) panel.append(row([button('新增片段', () => edit(null), 'button'), button('返回', () => { managing = false; draw(); }, 'text-button')]));
+      else {
+        const pick = accept => () => { fileInput.accept = accept; fileInput.click(); dialog.close(); };
+        const grid = el('div', { class: 'composer-tool-grid' });
+        for (const [label, icon, action] of [['檔案', 'file', pick('')], ['照片', 'photo', pick('image/*')],
+          ['指令', 'command', () => { dialog.close(); showCommandPalette(); }], ['工作區', 'space', () => { dialog.close(); showWorkspacePicker(); }]])
+          grid.append(el('button', { type: 'button', class: 'composer-tool-tile', on: { click: action } }, [sheetIcon(icon), text('span', label)]));
+        panel.append(grid, row([text('h3', '提示詞片段', 'grow'), button('管理', () => { managing = true; draw(); }, 'text-button')]));
+      }
+      if (!snippets.length) panel.append(text('p', '把常用指令存成片段，下次一鍵填入。', 'muted'));
+      snippets.forEach((snippet, index) => {
+        const body = el('span', { class: 'grow' }, [text('strong', snippet.title), text('small', snippet.body, 'snippet-preview')]);
+        if (!managing) panel.append(el('button', { type: 'button', class: 'snippet-entry', on: { click: () => {
+          if (!origin || state.me?.account_scope !== account) return;
+          saveDraft(origin, [draftFor(origin), snippet.body].filter(Boolean).join('\n')); dialog.close(); render();
+        } } }, [sheetIcon('snippet'), body]));
+        else panel.append(el('section', { class: 'snippet-manage' }, [body, row([
+          button('上移', () => { [snippets[index - 1], snippets[index]] = [snippets[index], snippets[index - 1]]; save(); draw(); }, 'quiet-button small', index === 0),
+          button('下移', () => { [snippets[index + 1], snippets[index]] = [snippets[index], snippets[index + 1]]; save(); draw(); }, 'quiet-button small', index === snippets.length - 1),
+          button('編輯', () => edit(index), 'text-button'), button('刪除', () => confirm('刪除片段？', `確定刪除「${snippet.title}」？`, '確認刪除', () => { snippets.splice(index, 1); save(); draw(); }), 'text-button')])]));
+      });
+      if (managing) panel.append(button('恢復預設片段', () => confirm('恢復預設片段？', '目前片段及排序將被三條預設片段取代。', '恢復預設', () => { snippets = defaults(); save(); draw(); }), 'text-button'));
+    };
+    draw();
+  }
+  async function showCommandPalette() {
+    const panel = el('div', { class: 'sheet-content' }, [text('p', '正在讀取指令…')]);
+    const dialog = chatSheet('指令', panel);
+    // This endpoint is shared with the native client's command catalog.
+    const body = await loadSafe(() => rpc('commands.catalog', { profile: state.profile }));
+    if (!dialog.isConnected) return;
+    panel.replaceChildren();
+    if (!body) { panel.append(text('p', '無法讀取指令，請稍後重試。')); return; }
+    const pairs = [...(body.pairs || []), ...(body.categories || []).flatMap(c => c.pairs || c.commands || []), ...(body.items || []), ...(body.commands || [])];
+    const commands = pairs.map(c => Array.isArray(c) ? { command: c[0], description: c[1] } : typeof c === 'string' ? { command: c } : c);
+    const search = el('input', { type: 'search', placeholder: '搜尋指令', 'aria-label': '搜尋指令', class: 'search' });
+    const list = el('div', { class: 'stack' });
+    const draw = () => { list.replaceChildren(); for (const command of commands.filter(c => JSON.stringify(c).toLowerCase().includes(search.value.toLowerCase()))) {
+      const value = command.text || command.command || command.name || command.value || command.display; if (typeof value !== 'string' || !value) continue;
+      list.append(button(value, () => { saveDraft(state.selected, `${value.startsWith('/') ? '' : '/'}${value} `); dialog.close(); render(); }));
+    } if (!list.children.length) list.append(text('p', '沒有符合的指令。')); };
+    search.addEventListener('input', draw); panel.append(search, list); draw();
+  }
+  function previewAttachment(file, index = state.attachments.indexOf(file)) {
+    const content = el('div', { class: 'sheet-content attachment-detail' }, [
+      text('h3', file.name, 'attachment-full-name'), text('p', `附件 ${index + 1} · ${file.size.toLocaleString()} bytes`),
+      text('p', `類型：${file.type || '未提供'}`),
+      ...(file.lastModified ? [text('p', `修改時間：${new Date(file.lastModified).toLocaleString()}`)] : [])]);
+    let url;
+    if (file.type.startsWith('image/')) {
+      url = URL.createObjectURL(file); content.prepend(el('img', { src: url, alt: file.name, class: 'attachment-image' }));
+    } else content.append(text('p', '這裡僅顯示附件資訊；送出前仍可移除。', 'muted'));
+    const dialog = chatSheet('附件詳情', content);
+    if (url) dialog.addEventListener('close', () => URL.revokeObjectURL(url), { once: true });
+  }
+  async function steerCurrentRun() {
+    const session = state.selected; if (!session || state.run !== 'running' || state.attachments.length) return;
+    const key = scopedSessionKey(session), draft = draftFor(session), value = draft.trim();
+    if (!value || state.steering.has(key)) return;
+    state.steering.add(key); updateComposer();
+    try { await rpc('session.steer', { session_id: session.runtimeId, profile: session.profile, text: value });
+      if (draftFor(session) === draft) clearDraft(session);
+      notice('追加要求已送達。');
+    } catch (error) { showError(error); }
+    finally { state.steering.delete(key); if (state.selected && scopedSessionKey(state.selected) === key) render(); }
+  }
+  function queueCurrentMessage() {
+    const session = state.selected; if (!session || state.run !== 'running') return;
+    const prompt = draftFor(session).trim(); if (!prompt && !state.attachments.length) return;
+    state.queuedMessages.set(scopedSessionKey(session), { session: { ...session }, prompt, files: [...state.attachments], ready: false });
+    clearDraft(session); state.attachments = []; render();
+  }
+  async function submitBackgroundQueue(queued) {
+    const session = queued.session, key = scopedSessionKey(session);
+    if (queued.sending || queued.uncertain || state.queuedMessages.get(key) !== queued || state.profile !== session.profile) return;
+    queued.sending = true; let attempted = false;
+    try {
+      const resumed = await rpc('session.resume', { session_id: session.id, profile: session.profile, cols: 72, source: 'mobile-web' });
+      if (resumed.running || state.queuedMessages.get(key) !== queued || state.profile !== session.profile) return;
+      const target = { ...session, runtimeId: resumed.session_id };
+      if (session.workspacePath) await rpc('session.cwd.set', { session_id: target.runtimeId, profile: session.profile, cwd: session.workspacePath });
+      const additions = await prepareAttachments(target, queued.files);
+      if (state.queuedMessages.get(key) !== queued || state.profile !== session.profile) return;
+      const id = crypto.randomUUID(); attempted = true; queued.submissionId = id;
+      state.turnAttempts.set(key, { id, draft: queued.prompt });
+      await rpc('prompt.submit', { session_id: target.runtimeId, profile: session.profile, text: queued.prompt + additions, client_submission_id: id }, 120000);
+      if (state.turnAttempts.get(key)?.id === id) state.turnAttempts.delete(key);
+      if (state.queuedMessages.get(key) === queued) state.queuedMessages.delete(key);
+    } catch (error) {
+      if (attempted) { queued.uncertain = true; notice('排隊訊息送出狀態待核對，請打開原對話同步。'); }
+      else showError(error);
+    } finally { queued.sending = false; }
+  }
+  async function drainQueuedMessage(session) {
+    const key = scopedSessionKey(session), queued = state.queuedMessages.get(key);
+    if (!queued || queued.uncertain || queued.sending || !state.selected || scopedSessionKey(state.selected) !== key || state.run !== 'idle') return;
+    queued.ready = true;
+    // Never overwrite text or attachments entered after queueing; keep the queued item visible.
+    if (draftFor(session).trim() || state.attachments.length) { updateComposer(); return; }
+    state.queuedMessages.delete(key); saveDraft(session, queued.prompt); state.attachments = queued.files;
+    render(); await submitPrompt({ value: queued.prompt });
+  }
+  function showDecision(request) {
+    if (state.decisionDialog?.open) state.decisionDialog.close();
+    state.decisionSeen.add(requestDraftKey(request));
+    const content = requestCard(request, true);
+    const dialog = chatSheet(request.type === 'approval' ? '確認後再繼續' : '需要你的回答', content);
+    dialog.classList.add('decision-sheet'); dialog._requestKey = request.key; dialog._version = requestContentKey(request);
+    state.decisionDialog = dialog;
+    dialog.addEventListener('close', () => { if (state.decisionDialog === dialog) state.decisionDialog = null; }, { once: true });
+  }
+  function presentNextDecision() {
+    const dialog = state.decisionDialog;
+    if (dialog?.open) {
+      const current = state.pending.get(dialog._requestKey);
+      if (!current || requestContentKey(current) !== dialog._version || current.profile !== state.profile) dialog.close();
+      else return;
+    }
+    if (document.querySelector('dialog[open]')) return;
+    const request = [...state.pending.values()].find(r => r.profile === state.profile &&
+      r.runtimeId === state.selected?.runtimeId && !state.decisionSeen.has(requestDraftKey(r)));
+    if (request) showDecision(request);
+  }
+
   function renderChat() {
     const session = state.selected; if (!session) { state.tab = 'sessions'; return render(); }
     const layout = el('section', { class: 'chat-layout', 'data-session': scopedSessionKey(session) });
-    layout.append(heading(session.title || '新對話', `${session.profile} · ${session.model || '目前模型'}`, [
-      button('返回', () => switchTab('sessions'), 'quiet-button small'),
-    ]));
-    const stop = button('停止', stopRun, 'danger-button small chat-stop', state.run !== 'running');
-    layout.append(row([button('模型', showModelPicker, 'soft-button small'),
-      button('思考', showReasoningPicker, 'quiet-button small'), button('專案', showProjectPicker, 'quiet-button small'),
-      button('同步', () => recoverSession(), 'quiet-button small'), stop]));
+    const back = button('', mobileBack, 'chat-header-action'); back.setAttribute('aria-label', '返回'); back.append(chatGlyph('back'));
+    const options = button('', showChatOptions, 'chat-header-action'); options.setAttribute('aria-label', '對話設定'); options.append(chatGlyph('more'));
+    layout.append(el('header', { class: 'chat-header' }, [back,
+      el('div', { class: 'chat-heading' }, [text('h1', session.title || '新對話'), text('p', `${session.profile} · ${session.model || '目前模型'}`)]), options]));
     const feed = el('div', { class: 'chat-scroll', tabindex: '0', 'aria-label': '對話記錄' });
     const jump = button('回到最新訊息 ↓', () => { feed.scrollTop = feed.scrollHeight; jump.hidden = true; }, 'soft-button small chat-jump');
     jump.hidden = true;
     feed.addEventListener('scroll', () => { jump.hidden = feed.scrollHeight - feed.clientHeight - feed.scrollTop < 100; });
     feed.append(el('div', { class: 'chat-history' }), el('div', { class: 'chat-stream' }),
       el('div', { class: 'chat-tools' }), el('div', { class: 'chat-requests', 'aria-label': '待你確認' }));
-    layout.append(el('div', { class: 'chat-status', role: 'status' }), feed, jump);
-    const [composerWrap, composer] = field('訊息', 'textarea', draftFor(session), '想說什麼？');
-    composer.addEventListener('input', () => saveDraft(state.selected, composer.value));
+    layout.append(el('div', { class: 'chat-status', role: 'status' }), el('div', { class: 'chat-feed-container' }, [feed, jump]));
+    const [composerWrap, composer] = field('訊息', 'textarea', draftFor(session), '補充一句，或直接說…');
+    composer.rows = 1; composer.setAttribute('aria-label', '訊息');
+    composer.addEventListener('input', () => { saveDraft(session, composer.value); updateComposer(); });
     const attached = el('div', { class: 'attachments' });
     const fileInput = el('input', { type: 'file', multiple: '', hidden: '', on: { change: event => {
       for (const file of event.target.files || []) state.attachments.push(file);
-      render();
+      fileInput.value = ''; render();
     } } });
-    const tools = row([button('＋ 附件', () => fileInput.click(), 'quiet-button small'),
-      button('工作區檔案', () => showWorkspacePicker(), 'quiet-button small'),
-      button(state.recorder ? '完成錄音' : '語音輸入', () => startSpeech(composer), 'quiet-button small'),
-      button('送出', () => submitPrompt(composer), 'button chat-send', !canSubmitTurn(state.run, state.sendAttempted, session, state.profile))]);
-    layout.append(el('div', { class: 'composer' }, [composerWrap, attached, fileInput, tools]));
+    const tools = button('', () => showComposerTools(fileInput), 'composer-add'); tools.append(chatGlyph('plus'));
+    tools.setAttribute('aria-label', '加入內容');
+    const primary = button('語音輸入', () => {
+      if (state.run === 'running') return stopRun();
+      if (composer.value.trim() || state.attachments.length) return submitPrompt(composer);
+      return startSpeech(composer);
+    }, 'chat-send');
+    layout.append(el('div', { class: 'composer' }, [attached, fileInput,
+      el('div', { class: 'composer-line' }, [tools, composerWrap, primary]),
+      el('div', { class: 'voice-state', role: 'status' }), el('div', { class: 'queue-state', role: 'status' }),
+      el('div', { class: 'running-actions' }, [button('追加要求', steerCurrentRun, 'quiet-button chat-steer'),
+        button('排隊發送', queueCurrentMessage, 'quiet-button chat-queue')])]));
     main.append(layout); updateChat(true);
   }
   function updateChat(first = false) {
@@ -1059,48 +1523,86 @@
     status.textContent = state.run === 'uncertain' ? '送出狀態待確認。按「同步」查原操作，不會自動重送。' :
       active.size ? `有 ${active.size} 項待你確認，請往下查看。` : state.run === 'running' ? '正在處理…你可以閱讀舊訊息。' : state.run === 'preparing' ? '正在準備訊息…' : '';
     status.classList.toggle('status', Boolean(status.textContent));
-    layout.querySelector('.chat-send').disabled = !canSubmitTurn(state.run, state.sendAttempted, state.selected, state.profile);
-    layout.querySelector('.chat-stop').disabled = state.run !== 'running';
     const composer = layout.querySelector('.composer textarea');
     const draft = draftFor(state.selected); if (composer.value !== draft) composer.value = draft;
+    updateComposer();
     const attached = layout.querySelector('.attachments');
-    const attachmentSignature = state.attachments.map(file => `${file.name}:${file.size}:${file.lastModified}`).join('|');
+    const supportNames = new Set(['hermes-today-contract.md', 'hermes-today-writer.py', 'hermes-today-examples.json',
+      'hermes-today-cron-template.txt', 'today-recent-conversations.json', 'hermes-today-request.json',
+      'today-card-context.json.txt', 'today-card-action.json', 'today-conversation-context.txt']);
+    const isSupport = file => {
+      const name = file.name.replaceAll('\\', '/').split(/[?#]/)[0];
+      return name.includes('/.hermes-app/today/') || name.startsWith('.hermes-app/today/') || supportNames.has(name.split('/').pop());
+    };
+    const support = state.attachments.filter(isSupport);
+    const supportSignature = support.map(file => `${file.name}:${file.size}:${file.lastModified}`).join('|');
+    if (attached._supportSignature !== supportSignature) { attached._supportSignature = supportSignature; attached._showSupport = false; }
+    let toggle = layout.querySelector('.attachment-context-toggle');
+    if (support.length) {
+      if (!toggle) {
+        toggle = button('', () => { attached._showSupport = !attached._showSupport; updateChat(); }, 'text-button attachment-context-toggle');
+        attached.before(toggle);
+      }
+      toggle.textContent = `${attached._showSupport ? '收起相關背景' : '已帶上相關背景'} · ${support.length}`;
+      toggle.setAttribute('aria-expanded', String(Boolean(attached._showSupport)));
+    } else toggle?.remove();
+    const attachmentSignature = state.attachments.map(file => `${file.name}:${file.size}:${file.lastModified}`).join('|') + `:${Boolean(attached._showSupport)}`;
     if (attached._signature !== attachmentSignature) {
-      attached._signature = attachmentSignature; attached.replaceChildren(...state.attachments.map((file, index) => button(`${file.name} ×`, () => {
-        state.attachments.splice(index, 1); render();
-      }, 'attachment-chip')));
+      attached._signature = attachmentSignature;
+      const chips = state.attachments.flatMap((file, index) => {
+        if (isSupport(file) && !attached._showSupport) return [];
+        const label = `${index + 1}. ${file.name} · ${file.size.toLocaleString()} bytes`;
+        const preview = button(label, () => previewAttachment(file, index), 'attachment-preview');
+        preview.title = label; preview.setAttribute('aria-label', `查看附件 ${label}`);
+        const remove = button('×', () => { state.attachments.splice(index, 1); render(); }, 'attachment-remove');
+        remove.setAttribute('aria-label', `移除附件 ${label}`);
+        return [el('div', { class: 'attachment-chip' }, [preview, remove])];
+      });
+      attached.replaceChildren(...chips, ...(chips.length ? [text('span', String(chips.length), 'attachment-count')] : []));
     }
+    presentNextDecision();
     if (follow) feed.scrollTop = feed.scrollHeight; else feed.scrollTop = position;
     layout.querySelector('.chat-jump').hidden = follow;
   }
   async function startSpeech(input) {
+    const origin = state.selected; if (!origin) return;
+    const originAccount = state.me?.account_scope;
+    if (state.speechPhase !== 'idle') return notice('正在處理語音，請稍候。');
+    const accept = transcript => {
+      if (!originAccount || state.me?.account_scope !== originAccount) return;
+      const previous = draftFor(origin); saveDraft(origin, `${previous}${previous ? '\n' : ''}${transcript}`);
+      if (state.selected && scopedSessionKey(state.selected) === scopedSessionKey(origin)) { input.value = draftFor(origin); updateComposer(); }
+      else notice('語音已存回原對話草稿。');
+    };
     if (state.sttMode === 'server') return startServerSpeech();
     if (window.HermesNative?.postMessage) return loadSafe(async () => {
-      const result = await nativeCall('startListening', { locale: 'zh-TW' });
+      state.speechPhase = 'listening'; updateComposer();
+      let result; try { result = await nativeCall('startListening', { locale: 'zh-TW' }); } finally { state.speechPhase = 'idle'; updateComposer(); }
       if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('沒有辨識到語音');
-      input.value = `${input.value}${input.value ? '\n' : ''}${result.text}`;
-      saveDraft(state.selected, input.value);
+      accept(result.text);
     });
     const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Speech) return notice('這台裝置的瀏覽器沒有提供語音辨識，請用鍵盤輸入。');
     const recognition = new Speech(); recognition.lang = 'zh-TW'; recognition.interimResults = false;
-    recognition.onresult = event => { input.value = `${input.value}${input.value ? '\n' : ''}${event.results[0][0].transcript}`;
-      saveDraft(state.selected, input.value); };
+    recognition.onresult = event => accept(event.results[0][0].transcript);
+    recognition.onend = () => { state.speechPhase = 'idle'; updateComposer(); };
     recognition.onerror = () => notice('這次沒有辨識到語音，原本的文字已保留。');
-    recognition.start(); notice('正在聽你說話。語音辨識依瀏覽器與裝置支援。');
+    state.speechPhase = 'listening'; updateComposer();
+    try { recognition.start(); } catch (error) { state.speechPhase = 'idle'; updateComposer(); return showError(error); } notice('正在聽你說話。語音辨識依瀏覽器與裝置支援。');
   }
   async function startServerSpeech() {
     if (state.recorder) { state.recorder.stop(); return; }
     await loadSafe(async () => {
       if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error('此瀏覽器無法錄音。');
       const session = state.selected; if (!session) throw new Error('請先打開對話。');
+      const originAccount = state.me?.account_scope;
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const type = ['audio/mp4', 'audio/webm', 'audio/ogg'].find(mime => MediaRecorder.isTypeSupported(mime));
       const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
       const chunks = [];
       recorder.addEventListener('dataavailable', event => { if (event.data.size) chunks.push(event.data); });
       recorder.addEventListener('stop', () => loadSafe(async () => {
-        stream.getTracks().forEach(track => track.stop()); state.recorder = null; render();
+        stream.getTracks().forEach(track => track.stop()); state.recorder = null; state.speechPhase = 'transcribing'; render();
         const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
         if (!blob.size || blob.size > 8 * 1024 * 1024) throw new Error('錄音為空或超過 8 MiB。');
         const file = new File([blob], 'voice', { type: blob.type });
@@ -1109,10 +1611,11 @@
         if (!result.ok && result.ok !== undefined) throw new Error(result.message || '聽寫未完成');
         const transcript = result.transcript || result.text;
         if (typeof transcript !== 'string' || !transcript.trim()) throw new Error('沒有辨識到語音');
-        if (state.profile !== session.profile || state.selected?.id !== session.id) throw new Error('對話已切換，語音未放入草稿。');
+        if (!originAccount || state.me?.account_scope !== originAccount) return;
         const previous = draftFor(session); saveDraft(session, `${previous}${previous ? '\n' : ''}${transcript}`);
-        render(); notice('語音已放入草稿，請確認後送出。');
-      }));
+        if (state.profile === session.profile && state.selected?.id === session.id) { render(); notice('語音已放入草稿，請確認後送出。'); }
+        else notice('語音已存回原對話草稿。');
+      }).finally(() => { state.speechPhase = 'idle'; updateComposer(); }));
       recorder.start(); state.recorder = recorder; render(); notice('正在錄音；按「完成錄音」送到已設定的伺服器聽寫。');
       setTimeout(() => { if (state.recorder === recorder && recorder.state === 'recording') recorder.stop(); }, 15000);
     });
@@ -1138,30 +1641,32 @@
       reader.onerror = () => reject(new Error('無法讀取附件')); reader.readAsDataURL(file);
     });
   }
-  async function showWorkspacePicker(path = '') {
+  async function showWorkspacePicker(path = '', existingDialog = null) {
     await loadSafe(async () => {
-      const profile = state.profile; const body = await api(`/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
-      if (profile !== state.profile || state.tab !== 'chat') return;
+      const profile = state.profile, origin = state.selected; const body = await api(`/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+      if (profile !== state.profile || state.tab !== 'chat' || state.selected?.id !== origin?.id) return;
       const panel = card([text('h2', '從工作區選檔案'), text('p', body.path || '工作區')]);
-      panel.append(button('返回對話', render, 'quiet-button small'));
-      if (body.parent) panel.append(button('上一層', () => showWorkspacePicker(body.parent), 'quiet-button small'));
+      const dialog = existingDialog || chatSheet('工作區檔案', el('div'));
+      dialog.lastElementChild.replaceWith(panel);
+      panel.classList.add('sheet-content');
+      panel.append(button('返回對話', () => dialog.close(), 'quiet-button small'));
+      if (body.parent) panel.append(button('上一層', () => showWorkspacePicker(body.parent, dialog), 'quiet-button small'));
       for (const entry of dataArray(body, 'entries')) panel.append(button(
         `${entry.is_directory ? '資料夾' : '檔案'} · ${entry.name || entry.path}`,
-        () => entry.is_directory ? showWorkspacePicker(entry.path) : loadSafe(async () => {
+        () => entry.is_directory ? showWorkspacePicker(entry.path, dialog) : loadSafe(async () => {
           const doc = await api(`/files/read?path=${encodeURIComponent(entry.path)}`);
-          if (profile !== state.profile || state.tab !== 'chat') return;
+          if (profile !== state.profile || state.tab !== 'chat' || state.selected?.id !== origin?.id) return;
           const bytes = decodeDataURL(doc.data_url);
           if (bytes.length > 16 * 1024 * 1024) throw new Error('檔案超過 16 MiB，無法作為附件。');
           state.attachments.push(new File([bytes], doc.name || entry.name || 'workspace-file',
             { type: doc.mime_type || 'application/octet-stream' }));
-          render(); notice('已加入附件；送出前可移除。');
+          dialog.close(); render(); notice('已加入附件；送出前可移除。');
         }), 'quiet-button small'));
-      clear(); main.append(panel);
     });
   }
-  async function prepareAttachments(session) {
+  async function prepareAttachments(session, files = state.attachments) {
     const additions = [];
-    for (const file of state.attachments) {
+    for (const file of files) {
       if (file.size > 16 * 1024 * 1024) throw new Error(`${file.name} 超過 16 MiB`);
       const dataUrl = await fileToDataURL(file);
       if (file.type.startsWith('image/')) {
@@ -1232,7 +1737,7 @@
   async function stopRun() {
     const session = state.selected; if (!session?.runtimeId) return;
     await loadSafe(async () => { await rpc('session.interrupt', { session_id: session.runtimeId, profile: session.profile });
-      notice('已請 Hermes 停止，稍後同步結果。'); });
+      notice('已請Hermes停止，稍後同步結果。'); });
   }
   async function loadModels() {
     const body = await api('/model/options?explicit_only=1'); state.models = body; return body;
@@ -1256,38 +1761,55 @@
     return resumed;
   }
   async function showModelPicker() {
-    const body = await loadSafe(loadModels); if (!body) return;
-    const providers = dataArray(body, 'providers').filter(provider => provider.authenticated !== false);
-    const panel = card([text('h2', '這段對話的模型'), text('p', '選定後只影響目前對話。')]);
-    for (const provider of providers) {
-      panel.append(text('div', provider.name || provider.slug, 'subhead'));
-      for (const model of provider.models || []) panel.append(button(model, async () => {
-        const session = state.selected;
-        await loadSafe(async () => {
-          const resumed = await assertSelectionIdle(session);
-          const params = { session_id: resumed.session_id, profile: session.profile,
-            scope: 'session', key: 'model', value: `${model} --provider ${provider.slug} --session` };
-          const apply = async (confirmed = false) => {
-            const result = await rpc('config.set', { ...params, confirm_expensive_model: confirmed }, 120000);
-            if (result.confirm_required) {
-              const confirmPanel = card([text('h2', '確認模型切換'),
-                text('p', result.confirm_message || result.warning || '此模型需要額外確認。'),
-                button('確認切換', () => loadSafe(async () => {
-                  await assertSelectionIdle(session); await apply(true);
-                }), 'primary-button'), button('取消', render, 'soft-button')]);
-              clear(); main.append(confirmPanel); return;
-            }
-            if (result.scope && result.scope !== 'session') throw new Error('伺服器未確認單段對話設定。');
-            await readySession({ ...session, runtimeId: resumed.session_id });
-            const confirmedSelection = state.selected?.model === model && state.selected?.provider === provider.slug;
-            render(); notice(confirmedSelection ? '已查回這段對話的模型設定。' :
-              '切換指令已送出，伺服器尚未回傳相同模型；請稍後同步核對。');
-          };
-          await apply();
-        });
-      }, 'quiet-button small'));
-    }
-    panel.append(button('關閉', render, 'soft-button small')); clear(); main.append(panel);
+    const origin = state.selected; if (!origin) return;
+    const panel = el('div', { class: 'sheet-content model-content' });
+    const dialog = chatSheet('切換模型', panel);
+    const search = el('input', { type: 'search', class: 'search', placeholder: '搜尋已設定模型', 'aria-label': '搜尋已設定模型' });
+    const status = text('p', '正在讀取可用模型…'); const list = el('div', { class: 'model-list' });
+    panel.append(text('p', '僅影響目前對話'), search, status, list);
+    const body = await loadSafe(loadModels); if (!dialog.isConnected) return;
+    if (!body) { status.textContent = '無法讀取模型，請關閉後重試。'; return; }
+    const providers = dataArray(body, 'providers').filter(p => p.authenticated !== false);
+    let pending = '';
+    const draw = () => {
+      list.replaceChildren(); let count = 0;
+      for (const provider of providers) {
+        const models = (provider.models || []).filter(model => `${provider.name} ${provider.slug} ${model}`.toLowerCase().includes(search.value.toLowerCase()));
+        if (!models.length) continue;
+        list.append(text('h3', provider.name || provider.slug));
+        for (const model of models) {
+          count++;
+          const selected = state.selected?.model === model && state.selected?.provider === provider.slug;
+          const item = button(`${selected ? '✓ ' : ''}${model}${pending === `${provider.slug}/${model}` ? ' · 切換中…' : ''}`, () => apply(provider, model), 'model-choice', state.modelSwitching);
+          item.replaceChildren(el('span', { class: 'sheet-icon-well' }, [sheetIcon('model')]), text('span', model.split('/').pop(), 'grow model-name'),
+            text('span', pending === `${provider.slug}/${model}` ? '切換中…' : selected ? '✓' : '', 'model-state'));
+          item.setAttribute('aria-label', model); item.title = model;
+          item.setAttribute('aria-pressed', String(selected)); list.append(item);
+        }
+      }
+      status.textContent = count ? '' : '沒有符合的已設定模型。';
+    };
+    const apply = async (provider, model, confirmed = false) => {
+      if (state.modelSwitching) return;
+      state.modelSwitching = true; pending = `${provider.slug}/${model}`; draw(); updateComposer();
+      try {
+        const resumed = await assertSelectionIdle(origin);
+        const result = await rpc('config.set', { session_id: resumed.session_id, profile: origin.profile,
+          scope: 'session', key: 'model', value: `${model} --provider ${provider.slug} --session`, confirm_expensive_model: confirmed }, 120000);
+        if (result.confirm_required) {
+          const confirm = chatSheet('確認模型切換', el('div', { class: 'sheet-content' }, [
+            text('p', result.confirm_message || result.warning || '此模型需要額外確認。'),
+            button('確認切換', () => { confirm.close(); apply(provider, model, true); }, 'button')]));
+          return;
+        }
+        if (result.scope && result.scope !== 'session') throw new Error('伺服器未確認單段對話設定。');
+        await readySession({ ...origin, runtimeId: resumed.session_id });
+        if (state.selected?.model === model && state.selected?.provider === provider.slug) { notice('已查回這段對話的模型設定。'); dialog.close(); }
+        else status.textContent = '切換指令已送出，尚未查回相同模型；請同步核對。';
+      } catch (error) { status.textContent = error.message; }
+      finally { state.modelSwitching = false; pending = ''; if (dialog.isConnected) { const message = status.textContent; draw(); if (message) status.textContent = message; } updateComposer(); }
+    };
+    search.addEventListener('input', draw); draw();
   }
   async function showReasoningPicker() {
     const current = state.selected; if (!current) return;
@@ -1310,7 +1832,8 @@
           '設定已送出，伺服器尚未回傳相同狀態；請稍後同步。');
       });
     }, 'quiet-button small'));
-    panel.append(button('返回對話', render, 'soft-button small')); clear(); main.append(panel);
+    const dialog = chatSheet('思考程度', panel);
+    panel.append(button('返回對話', () => dialog.close(), 'soft-button small'));
   }
   async function showProjectPicker() {
     await loadSafe(async () => {
@@ -1331,7 +1854,8 @@
           });
         } } }, [text('strong', project.name || project.label || path), text('small', path)]));
       }
-      panel.append(button('返回對話', render, 'soft-button small')); clear(); main.append(panel);
+      const dialog = chatSheet('工作專案', panel);
+      panel.append(button('返回對話', () => dialog.close(), 'soft-button small'));
     });
   }
   function connectSocket() {
@@ -1393,7 +1917,11 @@
   }
   function mergeRequests(requests, runtimeId) {
     if (!Array.isArray(requests)) return;
-    for (const [key, request] of state.pending) if (request.runtimeId === runtimeId) state.pending.delete(key);
+    for (const [key, request] of state.pending) if (request.runtimeId === runtimeId && request.profile === state.profile) {
+      const draft = state.requestDrafts.get(requestDraftKey(request));
+      if (draft?.check) { draft.check.canDismiss = false; draft.check.message = '已取得伺服器的確認狀態。'; }
+      state.pending.delete(key);
+    }
     for (const request of requests) {
       if (!request || typeof request !== 'object') continue;
       if (request.method === 'approval' || request.method === 'clarify') {
@@ -1401,7 +1929,7 @@
         continue;
       }
       const key = String(request.request_id || request.id || ''); if (!key) continue;
-      state.pending.set(key, { key, runtimeId, profile: state.profile,
+      state.pending.set(key, { key, runtimeId, conversationId: state.selected?.runtimeId === runtimeId ? state.selected.id : runtimeId, profile: state.profile,
         type: request.type || request.method || 'approval', title: request.title || request.prompt || '待你確認',
         details: request.description || request.message || '', choices: request.choices || [],
         serverId: request.server_request_id ?? null, questionId: request.question_id || '' });
@@ -1417,13 +1945,13 @@
       for (const question of params.questions) {
         if (!question?.qid || params.answers?.[question.qid] !== undefined) continue;
         const key = `${id}:${question.qid}`;
-        state.pending.set(key, { key, runtimeId, profile: params.profile || state.profile,
+        state.pending.set(key, { key, runtimeId, conversationId: state.selected?.runtimeId === runtimeId ? state.selected.id : runtimeId, profile: params.profile || state.profile,
           type: 'clarify', title: question.question || '待你回答', details: params.description || '',
           choices: question.choices || [], multiSelect: Boolean(question.multi_select),
           serverId: frame.id, questionId: question.qid });
       }
     } else if (frame.method === 'approval') {
-      state.pending.set(id, { key: id, runtimeId, profile: params.profile || state.profile,
+      state.pending.set(id, { key: id, runtimeId, conversationId: state.selected?.runtimeId === runtimeId ? state.selected.id : runtimeId, profile: params.profile || state.profile,
         type: 'approval', title: params.command || params.tool_name || '需要確認操作',
         details: params.description || '', choices: params.choices ||
           ['once', ...(params.smart_denied || params.allow_session === false ? [] : ['session']),
@@ -1449,12 +1977,12 @@
     }
     const payload = params.payload || params;
     const runtimeId = String(params.session_id || payload.session_id || '');
-    if (type === 'session.info' && state.selected?.runtimeId === runtimeId) {
+    if (type === 'session.info' && state.selected?.runtimeId === runtimeId && (!payload.profile || payload.profile === state.selected.profile)) {
       state.selected = selectionFromInfo(state.selected, { session_id: runtimeId, info: payload });
     }
     if (type === 'approval.request' || type === 'clarify.request') {
       const key = String(payload.request_id || payload.id || '');
-      if (key && runtimeId) state.pending.set(key, { key, runtimeId, profile: payload.profile || state.profile,
+      if (key && runtimeId) state.pending.set(key, { key, runtimeId, conversationId: state.selected?.runtimeId === runtimeId ? state.selected.id : runtimeId, profile: payload.profile || state.profile,
         type: type.startsWith('approval') ? 'approval' : 'clarify',
         title: payload.title || payload.prompt || '待你確認', details: payload.description || payload.message || '',
         choices: payload.choices || [], serverId: null, questionId: payload.question_id || '' });
@@ -1472,7 +2000,15 @@
       if (state.tab === 'tasks' || state.tab === 'chat') render(); return;
     }
     const session = state.selected;
-    if (!session || session.runtimeId !== runtimeId) return;
+    if (!session || session.runtimeId !== runtimeId || (payload.profile && payload.profile !== session.profile)) {
+      if (type === 'message.complete') {
+        const queued = [...state.queuedMessages.values()].find(q => q.session.runtimeId === runtimeId && q.session.profile === (payload.profile || state.profile));
+        if (queued) { queued.ready = true;
+          if (!['error', 'failed', 'failure', 'cancelled', 'interrupted'].includes(payload.status)) loadSafe(() => submitBackgroundQueue(queued));
+        }
+      }
+      return;
+    }
     if (type === 'message.start') { state.run = 'running'; state.streamStarted = true; state.streamed = ''; state.reasoning = ''; render(); return; }
     if (type === 'message.delta' && state.streamStarted) state.streamed += String(payload.text || '');
     if (type === 'message.interim' && state.streamStarted && payload.text) state.streamed = String(payload.text);
@@ -1485,11 +2021,13 @@
       state.run = 'idle'; state.sendAttempted = false;
       state.streamStarted = false;
       if (payload.text) state.streamed = String(payload.text);
-      state.turnAttempts.delete(scopedSessionKey(session));
+      if (!state.queuedMessages.get(scopedSessionKey(session))?.uncertain) state.turnAttempts.delete(scopedSessionKey(session));
       render(); loadSafe(async () => {
         await loadMessages();
         if (state.selected?.id !== session.id || state.profile !== session.profile) return;
         state.streamed = ''; state.reasoning = ''; if (state.tab === 'chat') render();
+        if (!['error', 'failed', 'failure', 'cancelled', 'interrupted'].includes(payload.status)) await drainQueuedMessage(session);
+        else { const queued = state.queuedMessages.get(scopedSessionKey(session)); if (queued) queued.ready = true; updateComposer(); }
       });
     }
     if (state.tab === 'chat' && type !== 'message.complete') render();
@@ -1526,7 +2064,7 @@
     });
   }
   async function refreshTasks() {
-    await loadSafe(async () => {
+    return loadSafe(async () => {
       const profile = state.profile;
       const [body, sessions] = await Promise.all([api('/cron/jobs'),
         api('/sessions?limit=100&offset=0&include_children=false&order=recent')]);
@@ -1542,24 +2080,66 @@
       } catch { state.activeRuns = []; state.activeRunsComplete = false; }
       if (state.selected) await recoverSession(false);
       if (state.tab === 'tasks') render();
+      return true;
     });
   }
   function requestContentKey(request) {
     return JSON.stringify([request.type, request.title, request.details, request.choices, request.multiSelect,
       request.serverId, request.questionId]);
   }
-  function requestDraftKey(request) { return `${request.profile}::${request.runtimeId}::${request.key}::${requestContentKey(request)}`; }
-  function requestCard(request) {
+  function requestDraftKey(request) { return `${request.profile}::${request.conversationId || request.runtimeId}::${request.key}::${requestContentKey(request)}`; }
+  function canDismissDecision(request) {
+    const draft = state.requestDrafts.get(requestDraftKey(request)), check = draft?.check;
+    const current = state.pending.get(request.key);
+    return Boolean(check?.canDismiss && !check.checking && !draft.submitting && !draft.uncertain && current &&
+      requestContentKey(current) === requestContentKey(request) && current.runtimeId === request.runtimeId &&
+      current.profile === request.profile && state.profile === request.profile &&
+      state.me?.account_scope === check.account && state.ws === check.socket);
+  }
+  async function recheckDecision(request) {
+    const key = requestDraftKey(request), draft = state.requestDrafts.get(key);
+    if (!draft || draft.submitting || draft.check?.checking || state.profile !== request.profile) return;
+    const check = { checking: true, canDismiss: false, account: state.me?.account_scope, socket: state.ws, message: '正在核對伺服器狀態…' };
+    draft.check = check;
+    const current = () => state.me?.account_scope === check.account && state.ws === check.socket && state.profile === request.profile &&
+      state.pending.get(request.key)?.runtimeId === request.runtimeId && requestContentKey(state.pending.get(request.key) || {}) === requestContentKey(request);
+    try {
+      if (!state.wsReady) throw new Error('尚未連線，無法核對；提醒已保留。');
+      const result = await rpc('session.events.since', { session_id: request.runtimeId, profile: request.profile, last_seen: 0 }, 15000);
+      if (!current()) return;
+      if (Array.isArray(result.open_requests)) {
+        check.message = '已核對：伺服器仍在等待你的確認。';
+        mergeRequests(result.open_requests, request.runtimeId);
+      } else { check.canDismiss = true; check.message = '伺服器未提供可核對的狀態；若已在其他端處理，可移除此裝置提醒。'; }
+    } catch (error) {
+      if (current()) { check.canDismiss = true; check.message = '無法連線或讀取確認狀態；提醒已保留。'; }
+    } finally { check.checking = false; }
+  }
+  function dismissDecisionReminder(request) {
+    if (!canDismissDecision(request)) return notice('狀態已變動，請重新核對。');
+    const content = el('div', { class: 'sheet-content' }, [text('p', '僅移除此裝置提醒，伺服器不變。這不會同意、拒絕或重新執行任何操作；請先確認已在其他端處理。')]);
+    const dialog = chatSheet('移除此提醒？', content);
+    content.append(row([button('取消', () => dialog.close(), 'quiet-button'), button('確認移除提醒', () => {
+      if (!canDismissDecision(request)) { dialog.close(); return notice('狀態已變動，請重新核對。'); }
+      state.pending.delete(request.key); state.requestDrafts.delete(requestDraftKey(request));
+      dialog.close(); render(); notice('已移除此裝置提醒，伺服器不變。');
+    }, 'danger-button')]));
+  }
+  function requestCard(request, detailed = false) {
+    if (!detailed) return card([text('span', '等你決定', 'pill'), text('h2', request.title),
+      text('p', request.details || '', 'request-summary'), button('查看並確認', () => showDecision(request), 'button')], 'request-card');
     const draftKey = requestDraftKey(request);
     let draft = state.requestDrafts.get(draftKey);
     if (!draft) { draft = { selected: [], answer: '', submitting: false, uncertain: false }; state.requestDrafts.set(draftKey, draft); }
-    const panel = card([text('span', request.type === 'approval' ? '操作確認' : '待你回答', 'pill'),
-      text('h2', request.title), text('p', request.details || '請確認這項操作。', 'request-details')], 'request-card');
+    const content = el('div', { class: 'decision-content' }, [text('small', request.profile, 'muted'),
+      text('h2', request.title), text('p', request.details || '請確認這項操作。', 'request-details')]);
+    const panel = card([content], 'request-card');
     const choices = dataArray(request.choices, 'choices');
     const labels = { once: '允許一次', session: '這段對話允許', always: '一律允許', deny: '拒絕' };
     const options = choices.length ? choices.map(choice => {
       const value = typeof choice === 'string' ? choice : choice.value || choice.id || String(choice);
-      return { label: typeof choice === 'string' ? labels[choice] || choice : choice.label || choice.title || labels[value] || value, value };
+      return { label: typeof choice === 'string' ? labels[choice] || choice : choice.label || choice.title || labels[value] || value,
+        description: typeof choice === 'object' ? choice.description || '' : '', value };
     }) : request.type === 'approval' ? [{ label: '允許一次', value: 'once' }, { label: '拒絕', value: 'deny' }] : [];
     const answer = () => request.multiSelect ? [...draft.selected, draft.answer.trim()].filter(Boolean).join(', ') : draft.answer.trim() || draft.selected[0] || '';
     const submit = button(request.type === 'approval' ? '確認並繼續' : '送出回答', async () => {
@@ -1570,9 +2150,11 @@
     }, 'button');
     const inputs = [];
     function syncControls() {
-      submit.disabled = !answer() || draft.submitting || draft.uncertain;
+      submit.disabled = !answer() || draft.submitting || draft.uncertain || draft.check?.checking;
       submit.textContent = draft.uncertain ? '已送出，等待核對' : draft.submitting ? '正在送出…' : request.type === 'approval' ? '確認並繼續' : '送出回答';
-      for (const input of inputs) input.disabled = draft.submitting || draft.uncertain;
+      for (const input of inputs) input.disabled = draft.submitting || draft.uncertain || Boolean(draft.check?.checking);
+      if (checkStatus) { checkStatus.textContent = draft.check?.message || ''; recheck.disabled = draft.submitting || Boolean(draft.check?.checking);
+        removeReminder.hidden = !canDismissDecision(request); }
     }
     for (const option of options) {
       const input = el('input', { type: request.multiSelect ? 'checkbox' : 'radio', name: encodeURIComponent(draftKey), value: option.value });
@@ -1582,33 +2164,52 @@
         if (!request.multiSelect) draft.answer = '';
         syncControls();
       });
-      inputs.push(input); panel.append(el('label', { class: 'request-choice' }, [input, text('span', option.label)]));
+      inputs.push(input); content.append(el('label', { class: 'request-choice' }, [input,
+        el('span', { class: 'grow' }, [text('strong', option.label), ...(option.description ? [text('small', option.description, 'muted')] : [])])]));
     }
-    if (request.type === 'clarify') {
+    if (request.type === 'clarify' && (!options.length || request.multiSelect)) {
       const [wrap, input] = field(options.length ? '其他／補充回答' : '你的回答', 'textarea', draft.answer);
       input.addEventListener('input', () => { draft.answer = input.value; syncControls(); });
-      inputs.push(input); panel.append(wrap);
+      inputs.push(input); content.append(wrap);
     }
-    panel.append(row([button('重新核對', async () => { if (state.selected) await recoverSession(); else notice('請打開原對話核對。'); }, 'quiet-button small'), submit]));
+    const checkStatus = text('small', draft.check?.message || '', 'decision-check-status');
+    const recheck = button('已在其他端處理？核對狀態', async () => {
+      const work = recheckDecision(request); syncControls(); await work; if (panel.isConnected) syncControls();
+    }, 'quiet-button small');
+    const removeReminder = button('已處理，移除此提醒', () => dismissDecisionReminder(request), 'quiet-button small');
+    removeReminder.hidden = !canDismissDecision(request);
+    const footer = row([checkStatus, recheck, removeReminder, submit]); footer.classList.add('decision-footer'); panel.append(footer);
     syncControls(); return panel;
+  }
+  function taskTime(value) {
+    const date = new Date(value); return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat('zh-TW',
+      { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(date) : String(value || '未提供');
   }
   function cronCard(job) {
     const id = job.id || job.job_id; const enabled = job.enabled !== undefined ? job.enabled : !job.paused;
-    const schedule = typeof job.schedule === 'string' ? job.schedule :
-      job.schedule?.display || job.schedule?.expr || job.schedule?.expression || '';
-    return card([text('h2', job.name || job.title || '定時任務'),
-      text('p', `${schedule}${job.next_run_at ? ` · 下次 ${job.next_run_at}` : ''}`),
-      row([button('詳情', () => showCronDetail(id), 'quiet-button small'),
-        button('編輯', () => editCron(job), 'quiet-button small'),
-        button(enabled ? '暫停' : '恢復', () => cronAction(id, enabled ? 'pause' : 'resume'), 'soft-button small'),
-        button('立即執行', () => cronAction(id, 'trigger'), 'quiet-button small'),
-        button('刪除', () => deleteCron(id), 'danger-button small')])]);
+    const schedule = typeof job.schedule === 'string' ? job.schedule : job.schedule?.display || job.schedule?.expr || job.schedule?.expression || '';
+    const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(schedule);
+    const scheduleLabel = daily ? `每天 ${daily[2].padStart(2, '0')}:${daily[1].padStart(2, '0')}` : schedule;
+    const toggle = el('input', { type: 'checkbox', role: 'switch', 'aria-label': `${job.name || '定時任務'}啟用`, on: { change: async () => {
+      toggle.disabled = true;
+      const changed = await cronAction(id, toggle.checked ? 'resume' : 'pause');
+      if (!changed) toggle.checked = enabled;
+      toggle.disabled = false;
+    } } }); toggle.checked = enabled;
+    const name = button(job.name || job.title || '定時任務', () => showCronDetail(id), 'text-button cron-title');
+    return card([el('div', { class: 'row cron-top' }, [el('div', { class: 'grow' }, [name, text('p', scheduleLabel, 'cron-schedule')]), toggle]),
+      el('div', { class: 'row' }, [text('small', !enabled ? '已暫停' : job.next_run_at ? `下次 ${taskTime(job.next_run_at)}` : '已啟用 · 時間待同步', 'grow muted'),
+        uiMore('任務選項', [['查看安排', () => showCronDetail(id)], ['編輯安排', () => editCron(job)],
+          ['現在執行一次', () => cronAction(id, 'trigger')], ['刪除安排', () => deleteCron(id), true]])])], 'cron-card');
   }
+
   function renderTasks() {
     main.append(heading('任務', '把約好的事，穩穩接住', [
-      button('刷新', refreshTasks, 'text-button'), button('＋', () => editCron(null), 'soft-button small')]));
-    main.append(el('div', { class: 'task-tabs' }, [['current', '進行中'], ['scheduled', '定時安排'], ['completed', '已完成']].map(([key, label]) =>
+      el('button', { type: 'button', class: 'text-button task-refresh', 'aria-label': '刷新', text: '↻', on: { click: refreshTasks } }),
+      el('button', { type: 'button', class: 'text-button task-create', 'aria-label': '新增定時任務', text: '＋', on: { click: () => editCron(null) } })]));
+    main.append(el('div', { class: 'task-tabs' }, [['current', `進行中${state.pending.size + state.activeRuns.length ? ' · ' + (state.pending.size + state.activeRuns.length) : ''}`], ['scheduled', '定時安排'], ['completed', '已完成']].map(([key, label]) =>
       button(label, () => { state.taskView = key; render(); }, state.taskView === key ? 'soft-button small' : 'quiet-button small'))));
+    if (state.pending.size && state.taskView !== 'current') main.append(button(`有 ${state.pending.size} 件事需要你確認`, () => { state.taskView = 'current'; render(); }, 'text-button'));
     if (state.taskView === 'current') {
       if (state.pending.size) for (const request of state.pending.values()) main.append(requestCard(request));
       if (state.activeRuns.length) main.append(text('div', '已核對的執行中對話', 'subhead'));
@@ -1624,9 +2225,13 @@
           !state.cron.some(item => /running/i.test(item.state || item.status || '')))
         main.append(text('p', '目前沒有已查回的進行中事項。', 'empty'));
     } else if (state.taskView === 'scheduled') {
-      main.append(button('新增定時任務', () => editCron(null), 'button small'));
       if (!state.cron.length) main.append(text('p', '目前沒有定時任務。', 'empty'));
-      else state.cron.forEach(job => main.append(cronCard(job)));
+      else {
+        const paused = state.cron.filter(job => job.enabled === false || job.paused);
+        state.cron.filter(job => state.showPausedTasks || !paused.includes(job)).slice().sort((a, b) =>
+          (Date.parse(a.next_run_at) || Infinity) - (Date.parse(b.next_run_at) || Infinity)).forEach(job => main.append(cronCard(job)));
+        if (paused.length) main.append(button(state.showPausedTasks ? '收起已暫停安排' : `已暫停 · ${paused.length}`, () => { state.showPausedTasks = !state.showPausedTasks; render(); }, 'text-button'));
+      }
     } else {
       const history = state.cron.filter(job => job.last_run_at);
       if (!history.length && !state.taskSessions.length) main.append(text('p', '目前沒有可查回的完成記錄。', 'empty'));
@@ -1650,16 +2255,17 @@
         text('p', `下次：${job.next_run_at || '未提供'} · 最近：${job.last_run_at || '未執行'}`),
         text('p', `最近結果：${job.last_status || '未提供'}`),
         text('p', job.prompt || '', 'document'),
-        row([button('返回任務', render, 'quiet-button small'), button('編輯', () => editCron(job), 'soft-button small')])]);
-      clear(); main.append(panel);
+        row([button('返回任務', mobileBack, 'quiet-button small'), button('編輯', () => editCron(job), 'soft-button small')])]);
+      mobilePush(); clear(); main.append(panel);
     });
   }
   function editCron(job) {
+    mobilePush();
     const [nameWrap, name] = field('名稱', 'text', job?.name || '');
     const [scheduleWrap, schedule] = field('排程', 'text', typeof job?.schedule === 'string' ? job.schedule : job?.schedule?.expr || '');
     const [promptWrap, prompt] = field('工作內容', 'textarea', job?.prompt || '');
     const panel = card([text('h2', job ? '編輯定時任務' : '新增定時任務'), nameWrap, scheduleWrap, promptWrap,
-      row([button('返回', render, 'quiet-button small'), button('儲存', async () => {
+      row([button('返回', mobileBack, 'quiet-button small'), button('儲存', async () => {
         await loadSafe(async () => {
           const id = job?.id || job?.job_id;
           if (job) await api(`/cron/jobs/${encodeURIComponent(id)}`, { method: 'PUT', body: {
@@ -1672,9 +2278,11 @@
     clear(); main.append(panel);
   }
   async function cronAction(id, action) {
-    await loadSafe(async () => {
+    return loadSafe(async () => {
       await api(`/cron/jobs/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: {} });
-      await refreshTasks(); notice(action === 'trigger' ? '已請伺服器執行；結果請查看任務記錄。' : '已查回任務狀態。');
+      if (!await refreshTasks()) return false;
+      notice(action === 'trigger' ? '已請伺服器執行；結果請查看任務記錄。' : '已查回任務狀態。');
+      return true;
     });
   }
   async function deleteCron(id) {
@@ -1687,23 +2295,33 @@
       const profile = state.profile;
       const body = await api(`/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
       if (state.profile !== profile) return;
-      state.files = body; state.filePath = body.path || path || '';
+      const nextPath = body.path || path || '';
+      if (state.tab === 'files' && state.files && nextPath !== state.filePath) mobilePush();
+      state.document = null; state.files = body; state.filePath = nextPath;
+      if (!state.workspaceRoot) state.workspaceRoot = body.root || body.root_path || body.path || '';
       if (state.tab === 'files') render();
     });
   }
   function renderFiles() {
-    main.append(heading('文件', state.profile, [button('⋯', () => refreshFiles(), 'text-button')]));
+    main.append(heading('文件', state.profile, [uiMore('文件選項', [
+      ['切換專案', async () => { await refreshProjects(); const sheet = uiSheet('切換專案', state.projects.map(project => button(project.name || project.label || '專案', () => {
+        const path = project.primary_path || project.primaryPath || project.paths?.[0];
+        if (!path) return notice('這個專案沒有可開啟的路徑。'); sheet.close(); state.workspaceRoot = path; refreshFiles(path);
+      }, 'quiet-button sheet-action'))); }],
+      [state.showHiddenFiles ? '隱藏系統檔案' : '顯示隱藏與系統檔案', () => { state.showHiddenFiles = !state.showHiddenFiles; render(); }],
+      ['複製目前路徑', () => loadSafe(async () => { await navigator.clipboard.writeText(state.filePath || ''); notice('已複製路徑。'); })],
+      ['上傳檔案', () => $('#workspace-upload').click()], ['重新整理', () => refreshFiles()]
+    ])]));
     const listing = state.files;
     if (!listing) { main.append(text('p', '正在讀取工作區。', 'empty')); return; }
     main.append(el('div', { class: 'file-path-row' }, [
       button('‹', () => refreshFiles(listing.parent), 'quiet-button small', !listing.parent),
-      text('span', listing.path || '工作區', 'path'),
-      button('上傳', () => $('#workspace-upload').click(), 'text-button')]));
+      text('span', '工作區' + (listing.path || '').replace(state.workspaceRoot || '', '').replaceAll('/', ' / '), 'path')]));
     const upload = el('input', { id: 'workspace-upload', type: 'file', hidden: '', on: { change: async event => {
       const file = event.target.files?.[0]; if (file) await uploadWorkspace(file);
     } } }); main.append(upload);
     if (state.document) return renderDocument();
-    const entries = dataArray(listing, 'entries');
+    const entries = dataArray(listing, 'entries').filter(entry => state.showHiddenFiles || !(entry.name || '').startsWith('.'));
     if (!entries.length) main.append(text('p', '這裡沒有可顯示的檔案。', 'empty'));
     else {
       const folders = entries.filter(entry => entry.is_directory);
@@ -1722,7 +2340,7 @@
           on: { click: () => openFile(entry) } }, [
           el('span', { class: 'file-well' }, [el('img', { src: '/mobile/file.svg', alt: '' })]),
           el('span', { class: 'grow' }, [text('strong', entry.name || entry.path),
-            text('small', `${entry.mime_type || '檔案'} · ${entry.size ?? 0} bytes`)]) ]));
+            text('small', Number(entry.size || 0) < 1024 ? `${entry.size || 0} B` : Number(entry.size) < 1048576 ? `${(entry.size / 1024).toFixed(1)} KB` : `${(entry.size / 1048576).toFixed(1)} MB`)]) ]));
         main.append(list);
       }
     }
@@ -1742,6 +2360,7 @@
       const body = await api(`/files/read?path=${encodeURIComponent(entry.path)}`);
       if (state.profile !== profile) return;
       if (!body.data_url?.startsWith('data:')) throw new Error('伺服器沒有返回檔案內容');
+      if (state.tab === 'files' && state.document?.path !== entry.path) mobilePush();
       state.document = { ...entry, ...body }; render();
     });
   }
@@ -1762,7 +2381,7 @@
     const editable = /^text\//.test(mime) || /\.(md|txt|json|csv)$/i.test(doc.path || '');
     const pdf = isPdfBytes(bytes);
     const blob = new Blob([bytes], { type: mime });
-    const panel = card([text('h2', doc.name || doc.path), text('p', doc.path, 'path')]);
+    const panel = card([text('h2', doc.name || doc.path), text('p', doc.path, 'path')], 'document-panel');
     let editor;
     if (editable) {
       let content; try { content = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
@@ -1786,7 +2405,7 @@
         el('iframe', { class: 'pdf-preview', src: activePdfURL, title: `${doc.name || '文件'} PDF 預覽`,
           referrerpolicy: 'no-referrer' }));
     } else panel.append(text('p', '這個格式請下載後查看；目前不在頁面中執行檔案內容。'));
-    panel.append(row([button('返回', () => { state.document = null; render(); }, 'quiet-button small'),
+    panel.append(row([button('返回', mobileBack, 'quiet-button small'),
       ...(pdf && window.HermesNative?.postMessage ? [button('系統預覽 PDF', () => loadSafe(async () => {
         const encoded = doc.data_url.split(',')[1];
         await nativeCall('previewPDF', { name: doc.name || 'document.pdf',
@@ -1819,41 +2438,48 @@
     main.append(panel);
   }
   function renderMe() {
-    if (state.mePage === 'settings') return renderServerSettings();
+    if (state.mePage === 'settings') return renderMobileSettings();
+    if (state.mePage === 'server-settings') return renderServerSettings();
     if (state.mePage === 'soul' || state.mePage === 'memory') return renderProfileDocument();
     if (state.mePage === 'guide') return renderGuide();
+    if (state.mePage === 'connection') { main.append(uiPageHeading('我的伺服器')); renderMobileConnection(); return; }
+    if (state.mePage === 'appearance') { main.append(uiPageHeading('外觀')); renderMobileAppearance(); return; }
+    if (state.mePage === 'edit-profile') { main.append(uiPageHeading('編輯資料')); renderMobileEditProfile(); return; }
+    if (state.mePage === 'inventory') { main.append(uiPageHeading('技能與工具')); renderMobileInventory(); return; }
     main.append(heading('我的', ''));
+    const photo = avatarVisual('profile-avatar');
+    const avatar = el('button', { class: 'avatar-open', 'aria-label': '查看個人照片', on: { click: () => {
+      const sheet = uiSheet(state.nickname || '朋友', [avatarVisual('profile-photo-large'), button('編輯資料', () => { sheet.close(); uiProfilePage('edit-profile'); }, 'button')]);
+    } } }, [photo]);
+    main.append(el('div', { class: 'profile-intro' }, [avatar, el('div', {}, [text('h2', state.nickname || '朋友'),
+      text('p', '個人工作助理'), button('編輯資料', () => uiProfilePage('edit-profile'), 'text-button small')])]));
+    main.append(el('div', { class: 'profile-links' }, [uiProfileLink('我的伺服器', state.connection, 'settings', () => uiProfilePage('connection'))]),
+      el('div', { class: 'profile-links' }, [uiProfileLink('我的記憶', '長期事實、偏好與經驗', 'history', () => { mobilePush(); openProfileDocument('memory'); }),
+        uiProfileLink('我的心智', '人格、原則與行為邊界', 'home', () => { mobilePush(); openProfileDocument('soul'); })]),
+      el('div', { class: 'profile-links' }, [uiProfileLink('設定', '外觀、語音、通知與權限', 'settings', () => uiProfilePage('settings'))]),
+      el('div', { class: 'profile-links' }, [uiProfileLink('使用說明', '連接、對話、任務、語音與排查', 'files', () => uiProfilePage('guide'))]));
+  }
+  function renderMobileConnection() {
     const profiles = Array.isArray(state.me?.profiles) ? state.me.profiles : ['default'];
     const profileSelect = el('select', { 'aria-label': '選擇 Profile', on: { change: async event => {
-      state.profile = event.target.value; state.selected = null; state.sessions = []; state.files = null;
+      mobileReset(); state.profile = event.target.value; state.workspaceRoot = ''; state.selected = null; state.sessions = []; state.files = null;
       state.shareDraftIds = []; state.shareInbox = []; state.attachments = [];
       state.filePath = ''; state.document = null; state.projects = []; state.sessionProject = '';
-      state.cron = []; state.today = null; state.inventory = null; state.settings = null;
+      state.cron = []; state.activeRuns = []; state.activeRunsComplete = false; state.taskSessions = []; state.run = 'idle'; state.profileDoc = null; state.today = null; state.inventory = null; state.settings = null;
       state.mePage = ''; state.pending.clear(); restoreTodayOperation();
       if (window.HermesNative?.postMessage) nativeCall('setNotificationProfile', { profile: state.profile }).catch(() => {});
       render(); await refreshHome(); await loadShareInbox().catch(showError);
     } } });
     for (const profile of profiles) profileSelect.append(el('option', { value: profile,
       text: profile, selected: profile === state.profile ? '' : null }));
-    main.append(el('div', { class: 'profile-intro' }, [avatarVisual('profile-avatar'),
-      el('div', {}, [text('h2', state.nickname || '朋友'), text('p', '個人工作助理')])]));
     main.append(card([text('h2', '我的伺服器'),
       el('div', { class: 'field' }, [text('label', 'Profile'), profileSelect]),
       text('p', `連線狀態：${state.connection}`), row([
         button('重新連線', () => { connectSocket(); notice('正在重新連線。'); }, 'soft-button small'),
         button('登出', logout, 'danger-button small'),
       ])]));
-    main.append(el('div', { class: 'profile-links' }, [
-      el('button', { class: 'profile-link', type: 'button', on: { click: () => openProfileDocument('memory') } },
-        [appIcon('history'), el('span', { class: 'grow' }, [text('strong', '我的記憶'), text('small', '長期事實、偏好與經驗')]), text('span', '›')]),
-      el('button', { class: 'profile-link', type: 'button', on: { click: () => openProfileDocument('soul') } },
-        [appIcon('home'), el('span', { class: 'grow' }, [text('strong', '我的心智'), text('small', '人格、原則與行為邊界')]), text('span', '›')]) ]));
-    main.append(el('div', { class: 'profile-links' }, [
-      el('button', { class: 'profile-link', type: 'button', on: { click: openSettings } },
-        [appIcon('settings'), el('span', { class: 'grow' }, [text('strong', '設定'), text('small', '外觀、語音、通知與權限')]), text('span', '›')]) ]));
-    main.append(el('div', { class: 'profile-links' }, [
-      el('button', { class: 'profile-link', type: 'button', on: { click: () => { state.mePage = 'guide'; render(); } } },
-        [appIcon('files'), el('span', { class: 'grow' }, [text('strong', '使用說明'), text('small', '連接、對話、任務、語音與排查')]), text('span', '›')]) ]));
+  }
+  function renderMobileInventory() {
     main.append(text('div', '已連接的能力', 'subhead'));
     const inventory = state.inventory;
     if (!inventory) main.append(card([text('p', '可查看技能、工具與連接服務的名稱和狀態。'),
@@ -1870,7 +2496,8 @@
         ...(key === 'skills' && item.name ? [button('內容', () => showSkillContent(item.name), 'quiet-button small')] : [])])) :
         [text('p', body?.error || '目前沒有可顯示的項目。')]) ]));
     }
-    main.append(text('div', '外觀', 'subhead'));
+  }
+  function renderMobileEditProfile() {
     const [nickWrap, nick] = field('本機稱呼', 'text', state.nickname, '朋友');
     main.append(card([el('div', { class: 'profile-photo-row' }, [avatarVisual('profile-avatar'),
       el('div', {}, [text('strong', state.nickname || '朋友'), text('small', `Profile：${state.profile}`)])]), nickWrap,
@@ -1881,18 +2508,29 @@
         ...(state.avatarPhoto ? [button('恢復原版頭像', () => loadSafe(async () => {
           localStorage.removeItem('hermes-web:avatar-photo'); state.avatarPhoto = ''; updateBrandAvatar(); render();
         }), 'quiet-button small')] : [])]),
-      text('p', '照片裁切成 256×256 後只存在此裝置；不會更改 Gateway 帳號或 Agent 身分。'),
-      row([button('跟隨系統', () => setTheme('system'), 'quiet-button small'),
-        button('淺色', () => setTheme('light'), 'quiet-button small'),
-        button('深色', () => setTheme('dark'), 'quiet-button small')]),
-      row(['clean', 'glass', 'paper'].map(skin => button(({ clean: '清爽', glass: '液態玻璃', paper: '紙本' })[skin],
-        () => setSkin(skin), skin === state.skin ? 'soft-button small' : 'quiet-button small')))]));
-    main.append(card([text('h2', '版本'), text('p', 'Hermes Web · 以 Hermes Android 4.0.1 操作契約為基準。'),
-      text('p', '實際 Gateway 與 iOS 功能以目前連線及裝置支援為準。')]));
+      text('p', '照片與稱呼只存在此裝置。')]));
+  }
+  function renderMobileAppearance() {
+    const segments = (label, choices, selected, action) => el('div', {
+      class: 'appearance-segments', role: 'group', 'aria-label': label,
+    }, choices.map(([value, title]) => el('button', { type: 'button', text: title,
+      'aria-pressed': value === selected, on: { click: () => action(value) } })));
+    main.append(card([text('h2', '顯示模式'), segments('顯示模式', [['system', '跟隨系統'], ['light', '淺色'], ['dark', '深色']],
+      document.documentElement.dataset.theme || 'system', value => { setTheme(value); render(); })]),
+      card([text('h2', '介面風格'), segments('介面風格', [['clean', '清爽'], ['glass', '液態玻璃'], ['paper', '紙本']], state.skin, setSkin)]));
+  }
+  function renderMobileSettings() {
+    main.append(uiPageHeading('設定'));
+    const serverPage = (section) => { state.settingsSection = section; openSettings(); };
+    for (const [label, entries] of [
+      ['應用偏好', [['遠端伺服器', () => uiProfilePage('connection')], ['外觀', () => uiProfilePage('appearance')], ['語音與通知', () => serverPage('voice')]]],
+      ['Hermes 助理', [['技能與工具', () => uiProfilePage('inventory')], ['模型設定', () => serverPage('model')], ['對話風格', () => serverPage('agent')], ['批准模式', () => serverPage('approvals')], ['記憶與上下文', () => serverPage('memory')], ['已封存對話', () => { state.showArchived = true; switchTab('sessions'); }]]],
+      ['關於', [['使用說明', () => uiProfilePage('guide')], ['版本', () => uiSheet('版本', [text('p', 'Hermes Web · Hermes Android 4.0.1 操作契約')])]]]
+    ]) main.append(text('h2', label, 'subhead'), el('div', { class: 'profile-links' }, entries.map(([title, action]) => uiProfileLink(title, '', 'settings', action))));
   }
   async function openSettings() {
     await loadSafe(async () => { const profile = state.profile; const body = await api('/settings');
-      if (profile !== state.profile) return; state.settings = body; state.mePage = 'settings';
+      if (profile !== state.profile) return; mobilePush(); state.settings = body; state.mePage = 'server-settings';
       try { state.models = await loadModels(); } catch { /* settings remain readable */ }
       render(); });
   }
@@ -1902,7 +2540,7 @@
     for (const [key, label, kind] of specification) {
       const current = source?.[key];
       let control;
-      if (kind === 'boolean') control = el('input', { type: 'checkbox' });
+      if (kind === 'boolean') control = el('input', { type: 'checkbox', role: 'switch', 'aria-label': label });
       else if (kind === 'reasoning') {
         const value = reasoningValue(current);
         control = el('select', { 'aria-label': label });
@@ -1913,7 +2551,8 @@
       else control = el('input', { type: kind === 'number' ? 'number' : 'text', value: current ?? '' });
       if (kind === 'boolean') control.checked = Boolean(current);
       fields[key] = [control, kind];
-      panel.append(el('div', { class: 'field' }, [text('label', label), control]));
+      panel.append(kind === 'boolean' ? el('label', { class: 'setting-switch-row' }, [text('span', label), control]) :
+        el('div', { class: 'field' }, [text('label', label), control]));
     }
     panel.append(button('儲存並查回', () => loadSafe(async () => {
       const changes = {};
@@ -1934,7 +2573,7 @@
   }
   function renderServerSettings() {
     const settings = state.settings?.settings;
-    main.append(heading('對話與語音設定', `Profile：${state.profile}`, [button('返回', () => { state.mePage = ''; render(); }, 'quiet-button small')]));
+    main.append(uiPageHeading(({ model: '模型設定', agent: '對話風格', approvals: '批准模式', memory: '記憶與上下文', voice: '語音與通知' })[state.settingsSection] || '設定'));
     if (!settings) { main.append(button('重新讀取', openSettings, 'soft-button')); return; }
     main.append(renderModelSettings(settings));
     main.append(settingForm('對話風格', 'agent', [['personality', '對話風格', 'text'],
@@ -1963,7 +2602,7 @@
           { value, text: option, selected: state[`${kind}Mode`] === value ? '' : null }));
         return el('div', { class: 'field' }, [text('label', label), select]);
       }),
-      row([button('試聽', () => speakText('嗨，我是澪。'), 'soft-button small'),
+      row([button('試聽', () => speakText('嗨，我是Hermes。'), 'soft-button small'),
         button('停止朗讀', () => { if (window.HermesNative?.postMessage) loadSafe(() => nativeCall('stopSpeaking'));
           state.speechAudio?.pause(); state.speechAudio = null; window.speechSynthesis?.cancel(); }, 'quiet-button small'),
         button('允許通知', () => loadSafe(async () => {
@@ -1973,6 +2612,9 @@
           else throw new Error('此裝置不支援通知。');
           notice(granted ? '通知權限已允許；實際送達仍需驗證。' : '通知權限未允許；可到裝置設定調整。');
         }), 'quiet-button small')])]));
+    const groups = { model: ['模型設定'], agent: ['對話風格', '時區', '顯示'], approvals: ['操作批准'], memory: ['記憶', '對話整理'], voice: ['伺服器聽寫', '伺服器朗讀', '本機語音與通知'] };
+    const visible = groups[state.settingsSection] || groups.agent;
+    for (const panel of main.querySelectorAll(':scope > .card')) if (!visible.includes(panel.querySelector('h2')?.textContent)) panel.remove();
   }
   function renderModelSettings(settings) {
     const panel = card([text('h2', '模型設定'), text('p', '這會影響新的伺服器對話；單一會話的模型可在對話內切換。')]);
@@ -2046,7 +2688,7 @@
   function renderProfileDocument() {
     const kind = state.mePage; const body = state.profileDoc;
     main.append(heading(kind === 'soul' ? 'SOUL' : 'MEMORY', `Profile：${state.profile}`,
-      [button('返回', () => { state.mePage = ''; render(); }, 'quiet-button small')]));
+      [button('返回', mobileBack, 'quiet-button small')]));
     if (body?.kind !== kind || body.profile !== state.profile) return;
     const [wrap, input] = field('內容', 'textarea', body.content || ''); input.rows = 20;
     main.append(card([text('p', body.exists ? '儲存時會檢查你讀取後有沒有被其他裝置修改。' : '此 Profile 尚無文件；儲存會建立文件。'),
@@ -2060,7 +2702,7 @@
   }
   function renderGuide() {
     main.append(heading('三步開始', '可以隨時回來重看。',
-      [button('返回', () => { state.mePage = ''; render(); }, 'quiet-button small')]));
+      [button('返回', mobileBack, 'quiet-button small')]));
     for (const [title, description] of [['1. 準備 Hermes', '伺服器上的模型、工具和記憶仍在原本的 Hermes。'],
       ['2. 連線', '使用 Gateway 帳號登入此行動入口；不需在網頁保存密碼。'],
       ['3. 開始使用', '先用簡潔首頁聊天；需要事項卡時再開啟深度首頁。']])
@@ -2103,8 +2745,9 @@
     await loadSafe(async () => {
       await authRequest('logout', { method: 'POST' });
       state.ws?.close(); state.ws = null; state.wsReady = false;
+      mobileReset();
       state.me = null; state.csrf = ''; state.selected = null; state.messages = [];
-      state.requestDrafts.clear(); state.turnAttempts.clear(); state.protocolReady = false;
+      state.requestDrafts.clear(); state.turnAttempts.clear(); state.queuedMessages.clear(); state.steering.clear(); state.decisionSeen.clear(); state.decisionDialog?.close(); state.protocolReady = false;
       state.capabilityPromise = null; state.reasoning = ''; state.streamStarted = false; state.streamed = '';
       state.run = 'idle'; state.sendAttempted = false;
       state.sessions = []; state.cron = []; state.files = null; state.pending.clear();
@@ -2116,6 +2759,7 @@
     });
   }
   function init() {
+    mobileReset();
     state.nickname = (localStorage.getItem('hermes-web:nickname') || '').slice(0, 30);
     const savedPhoto = localStorage.getItem('hermes-web:avatar-photo') || '';
     state.avatarPhoto = /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(savedPhoto) && savedPhoto.length <= 350000 ? savedPhoto : '';

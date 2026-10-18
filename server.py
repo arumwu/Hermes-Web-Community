@@ -254,7 +254,7 @@ async def home():
 
 @app.get("/mobile/health")
 async def health():
-    return {"status": "ready", "version": "0.3.0", "authentication": "required", "reference_android_version": "4.0.1"}
+    return {"status": "ready", "version": "0.4.0", "authentication": "required", "reference_android_version": "4.0.1"}
 
 
 @app.get("/mobile/api/deliveries/{submission_id}")
